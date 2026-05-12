@@ -8,7 +8,7 @@ struct NamedStruct {
 fn main() {
     let a: usize;
     let b: usize;
-    
+
     NamedStruct {
         opt_field: a, //~ ERROR mismatched types
         res_field: b, //~ ERROR mismatched types
