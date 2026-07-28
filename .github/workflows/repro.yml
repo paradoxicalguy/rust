@@ -17,11 +17,8 @@ jobs:
 
       - name: write bootstrap.toml
         run: |
-          cat > bootstrap.toml <<'EOF'
-          change-id = "ignore"
-          [llvm]
-          download-ci-llvm = false
-          EOF
+          printf 'change-id = "ignore"\n[llvm]\ndownload-ci-llvm = false\n' > bootstrap.toml
+          cat bootstrap.toml
 
       - name: disk usage before
         run: df -h
@@ -34,7 +31,8 @@ jobs:
 
       - name: run repro-check
         run: |
-          ./build/x86_64-unknown-linux-gnu/stage2-tools-bin/repro-check --src-root . \
+          set -o pipefail
+          ./build/x86_64-unknown-linux-gnu/stage1-tools-bin/repro-check --src-root . \
             | tee repro_run.log
 
       - name: disk usage after
