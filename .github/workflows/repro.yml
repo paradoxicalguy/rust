@@ -22,11 +22,11 @@ jobs:
         run: src/ci/scripts/free-disk-space-linux.sh
 
       - name: build repro-check
-        run: python x.py build src/tools/repro-check
+        run: python x.py build --stage 2 src/tools/repro-check
 
       - name: run repro-check
         run: |
-          ./build/x86_64-unknown-linux-gnu/stage1-tools-bin/repro-check --src-root . \
+          ./build/x86_64-unknown-linux-gnu/stage2-tools-bin/repro-check --src-root . \
             | tee repro_run.log
 
       - name: disk usage after
