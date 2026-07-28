@@ -409,10 +409,10 @@ pub fn compare_directories(
         };
         let dwarf_path_diff = diff_dwarf_paths(&dir_a.join(&rel_path), &dir_b.join(&rel_path));
 
-        let mut normalized_hash_a = None;
-        let mut normalized_hash_b = None;
-        let mut normalized_match = None;
-        let mut normalization_notes = Vec::new();
+        let normalized_hash_a = None;
+        let normalized_hash_b = None;
+        let normalized_match = None;
+        let normalization_notes = Vec::new();
 
         // --- Windows PE normalization ---
         #[cfg(windows)]
