@@ -109,7 +109,6 @@ use rustc_middle::mir::{AggregateKind, Operand, RETURN_PLACE, Rvalue, StatementK
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, DerefAdjustKind, PointerCoercion};
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{
-    RegionUtilitiesExt,
     self as rustc_ty, Binder, BorrowKind, ClosureKind, EarlyBinder, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt,
     TypeFlags, TypeVisitableExt, TypeckResults, UintTy, UpvarCapture,
 };
@@ -2094,15 +2093,15 @@ pub fn is_trait_impl_item(cx: &LateContext<'_>, hir_id: HirId) -> bool {
 ///     for _ in 2i32 {}
 /// }
 /// ```
-pub fn fn_has_unsatisfiable_preds(cx: &LateContext<'_>, did: DefId) -> bool {
+pub fn fn_has_unsatisfiable_clauses(cx: &LateContext<'_>, did: DefId) -> bool {
     use rustc_trait_selection::traits;
-    let predicates = cx
+    let clauses = cx
         .tcx
-        .predicates_of(did)
-        .predicates
+        .clauses_of(did)
+        .clauses
         .iter()
-        .filter_map(|(p, _)| if p.is_global() { Some(*p) } else { None });
-    traits::impossible_predicates(cx.tcx, traits::elaborate(cx.tcx, predicates).collect::<Vec<_>>())
+        .filter_map(|(c, _)| if c.is_global() { Some(*c) } else { None });
+    traits::impossible_clauses(cx.tcx, traits::elaborate(cx.tcx, clauses).collect::<Vec<_>>())
 }
 
 /// Returns the `DefId` of the callee if the given expression is a function or method call.

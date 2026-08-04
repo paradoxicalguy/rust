@@ -19,6 +19,7 @@ use rustc_type_ir::{
     OpaqueTypeKey, PredicateKind, Region, TypeFoldable, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor, TypingMode, eager_resolve_vars,
 };
+use thin_vec::ThinVec;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::has_only_region_constraints;
@@ -337,18 +338,6 @@ fn maybe_evaluate_root_goal_with_higher_recursion_limit<D, I>(
         Ok(goal_evaluation) => goal_evaluation.goal.predicate,
     };
 
-    // Some goals no longer overflow after the stalled infers are resolved.
-    // Thus we don't have to rerun eagerly here.
-    let has_stalled_infers = match predicate.kind().skip_binder() {
-        ty::PredicateKind::Clause(ty::ClauseKind::Projection(projection)) => {
-            projection.projection_term.has_non_region_infer()
-        }
-        _ => predicate.has_non_region_infer(),
-    };
-    if has_stalled_infers {
-        return;
-    }
-
     let rerun_result = delegate.commit_if_ok(|| {
         let rerun_result =
             EvalCtxt::enter_root(delegate, delegate.cx().recursion_limit() * 2, span, |ecx| {
@@ -396,19 +385,6 @@ fn maybe_evaluate_root_goal_for_proof_tree_with_higher_recursion_limit<D, I>(
         Ok(_) => {}
     }
 
-    // Some goals no longer overflow after the stalled infers are resolved.
-    // Thus we don't have to rerun eagerly here.
-    let predicate: I::Predicate = goal_evaluation.uncanonicalized_goal.predicate;
-    let has_stalled_infers = match predicate.kind().skip_binder() {
-        ty::PredicateKind::Clause(ty::ClauseKind::Projection(projection)) => {
-            projection.projection_term.has_non_region_infer()
-        }
-        _ => predicate.has_non_region_infer(),
-    };
-    if has_stalled_infers {
-        return;
-    }
-
     let rerun_result = delegate.commit_if_ok(|| {
         let (new_result, new_goal_evaluation) = evaluate_root_goal_for_proof_tree(
             delegate,
@@ -425,6 +401,7 @@ fn maybe_evaluate_root_goal_for_proof_tree_with_higher_recursion_limit<D, I>(
         }
     });
     if let Ok(rerun_result) = rerun_result {
+        let predicate: I::Predicate = goal_evaluation.uncanonicalized_goal.predicate;
         delegate.cx().emit_next_solver_overflow_fcw(predicate, span);
         *initial_result = rerun_result;
     }
@@ -847,11 +824,11 @@ where
         &self,
         canonical_goal: CanonicalInput<I>,
         certainty: Certainty,
-        mut stalled_vars: Vec<I::GenericArg>,
+        mut stalled_vars: ThinVec<I::GenericArg>,
         previously_succeeded_in_erased: SucceededInErased<I>,
     ) -> GoalStalledOn<I> {
         // Remove the canonicalized universal vars, since we only care about stalled existentials.
-        let mut sub_roots = Vec::new();
+        let mut sub_roots = ThinVec::new();
         stalled_vars.retain(|arg| match arg.kind() {
             // Lifetimes can never stall goals.
             ty::GenericArgKind::Lifetime(_) => false,

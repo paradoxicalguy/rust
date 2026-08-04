@@ -384,12 +384,10 @@ impl<'a> Diagnostic<'a, ()> for BuiltinTypeAliasBounds<'_> {
 }
 
 #[derive(Diagnostic)]
-#[diag(
-    "{$predicate_kind_name} bound {$predicate} does not depend on any type or lifetime parameters"
-)]
+#[diag("{$clause_kind_name} bound {$clause} does not depend on any type or lifetime parameters")]
 pub(crate) struct BuiltinTrivialBounds<'a> {
-    pub predicate_kind_name: &'a str,
-    pub predicate: Clause<'a>,
+    pub clause_kind_name: &'a str,
+    pub clause: Clause<'a>,
 }
 
 #[derive(Diagnostic)]
@@ -1880,7 +1878,7 @@ pub(crate) struct RedundantSemicolonsSuggestion {
 
 // traits.rs
 pub(crate) struct DropTraitConstraintsDiag<'a> {
-    pub predicate: Clause<'a>,
+    pub clause: Clause<'a>,
     pub tcx: TyCtxt<'a>,
     pub def_id: DefId,
 }
@@ -1888,8 +1886,8 @@ pub(crate) struct DropTraitConstraintsDiag<'a> {
 // Needed for def_path_str
 impl<'a> Diagnostic<'a, ()> for DropTraitConstraintsDiag<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
-        Diag::new(dcx, level, msg!("bounds on `{$predicate}` are most likely incorrect, consider instead using `{$needs_drop}` to detect whether a type can be trivially dropped"))
-            .with_arg("predicate", self.predicate)
+        Diag::new(dcx, level, msg!("bounds on `{$clause}` are most likely incorrect, consider instead using `{$needs_drop}` to detect whether a type can be trivially dropped"))
+            .with_arg("clause", self.clause)
             .with_arg("needs_drop", self.tcx.def_path_str(self.def_id))
     }
 }
@@ -3017,4 +3015,30 @@ pub(crate) enum Ptr2IntSuggestion<'tcx> {
         #[primary_span]
         cast_span: Span,
     },
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "creating an intermediate reference implies aliasing requirements even when immediately cast to a raw pointers"
+)]
+pub(crate) struct RawBorrowViaReference<'a> {
+    #[subdiagnostic]
+    pub suggestion: RawBorrowViaReferenceSuggestion<'a>,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum RawBorrowViaReferenceSuggestion<'a> {
+    #[multipart_suggestion(
+        "consider using `&raw {$mutbl}` for a safer and more explicit raw pointer",
+        applicability = "machine-applicable"
+    )]
+    Spanful {
+        #[suggestion_part(code = "&raw {mutbl} ")]
+        left: Span,
+        #[suggestion_part(code = "")]
+        right: Span,
+        mutbl: &'a str,
+    },
+    #[help("consider using `&raw {$mutbl}` for a safer and more explicit raw pointer")]
+    Spanless { mutbl: &'a str },
 }
