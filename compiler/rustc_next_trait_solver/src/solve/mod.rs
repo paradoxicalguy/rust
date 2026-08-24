@@ -87,9 +87,9 @@ where
     #[instrument(level = "trace", skip(self))]
     fn compute_type_outlives_goal(
         &mut self,
-        goal: Goal<I, ty::OutlivesPredicate<I, I::Ty>>,
+        goal: Goal<I, ty::OutlivesClause<I, I::Ty>>,
     ) -> QueryResultOrRerunNonErased<I> {
-        let ty::OutlivesPredicate(ty, lt) = goal.predicate;
+        let ty::OutlivesClause(ty, lt) = goal.predicate;
         let ty = self.normalize(GoalSource::Misc, goal.param_env, ty::Unnormalized::new_wip(ty))?;
 
         if self.cx().assumptions_on_binders() {
@@ -114,13 +114,13 @@ where
     #[instrument(level = "trace", skip(self))]
     fn compute_region_outlives_goal(
         &mut self,
-        goal: Goal<I, ty::OutlivesPredicate<I, Region<I>>>,
+        goal: Goal<I, ty::OutlivesClause<I, Region<I>>>,
     ) -> QueryResultOrRerunNonErased<I> {
-        let ty::OutlivesPredicate(a, b) = goal.predicate;
+        let ty::OutlivesClause(a, b) = goal.predicate;
 
         if self.cx().assumptions_on_binders() {
             let constraint =
-                rustc_type_ir::region_constraint::RegionConstraint::RegionOutlives(a, b);
+                rustc_type_ir::region_constraint::RegionConstraint::RegionOutlives(a, b, ());
             self.register_solver_region_constraint(constraint);
         } else {
             self.register_region_outlives(a, b, VisibleForLeakCheck::Yes);
@@ -394,7 +394,7 @@ where
             let projection_goal = Goal::new(
                 self.cx(),
                 param_env,
-                ty::ProjectionPredicate { projection_term: alias, term: normalized_term },
+                ty::ProjectionClause { projection_term: alias, term: normalized_term },
             );
             // We normalize the self type to be able to relate it with
             // types from candidates.

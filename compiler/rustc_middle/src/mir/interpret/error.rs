@@ -13,7 +13,7 @@ use rustc_span::def_id::DefId;
 use rustc_span::{DUMMY_SP, Span, Symbol};
 
 use super::{AllocId, AllocRange, ConstAllocation, Pointer, Scalar};
-use crate::error;
+use crate::diagnostics;
 use crate::mir::interpret::CtfeProvenance;
 use crate::mir::{ConstAlloc, ConstValue};
 use crate::ty::{self, Ty, TyCtxt, ValTree, layout, tls};
@@ -47,7 +47,7 @@ impl ErrorHandled {
         match self {
             &ErrorHandled::Reported(err, span) => {
                 if !err.allowed_in_infallible && !span.is_dummy() {
-                    tcx.dcx().emit_note(error::ErroneousConstant { span });
+                    tcx.dcx().emit_note(diagnostics::ErroneousConstant { span });
                 }
             }
             &ErrorHandled::TooGeneric(_) => {}
@@ -218,6 +218,17 @@ impl<'tcx> InterpErrorInfo<'tcx> {
     pub fn kind(&self) -> &InterpErrorKind<'tcx> {
         &self.0.kind
     }
+
+    /// Turn the given error into a human-readable string. Expects the string to be printed, so if
+    /// `RUSTC_CTFE_BACKTRACE` is set this will show a backtrace of the rustc internals that
+    /// triggered the error.
+    ///
+    /// This is NOT the preferred way to render an error; use `report` from `const_eval` instead.
+    /// However, this is useful when error messages appear in ICEs.
+    pub fn to_string(&self) -> String {
+        self.0.backtrace.print_backtrace();
+        self.0.kind.to_string()
+    }
 }
 
 fn print_backtrace(backtrace: &Backtrace) {
@@ -299,13 +310,6 @@ pub struct BadBytesAccess {
     pub access: AllocRange,
     /// Range of the bad memory that was encountered. (Might not be maximal.)
     pub bad: AllocRange,
-}
-
-/// Information about a size mismatch.
-#[derive(Debug)]
-pub struct ScalarSizeMismatch {
-    pub target_size: u64,
-    pub data_size: u64,
 }
 
 /// Information about a misaligned pointer.
@@ -406,8 +410,6 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     InvalidUninitBytes(Option<(AllocId, BadBytesAccess)>),
     /// Working with a local that is not currently live.
     DeadLocal,
-    /// Data size is not equal to target size.
-    ScalarSizeMismatch(ScalarSizeMismatch),
     /// A discriminant of an uninhabited enum variant is written.
     UninhabitedEnumVariantWritten(VariantIdx),
     /// An uninhabited enum variant is projected.
@@ -614,12 +616,6 @@ impl<'tcx> fmt::Display for UndefinedBehaviorInfo<'tcx> {
                 uninit = info.bad,
             ),
             DeadLocal => write!(f, "accessing a dead local variable"),
-            ScalarSizeMismatch(mismatch) => write!(
-                f,
-                "scalar size mismatch: expected {target_size} bytes but got {data_size} bytes instead",
-                target_size = mismatch.target_size,
-                data_size = mismatch.data_size,
-            ),
             UninhabitedEnumVariantWritten(_) => {
                 write!(f, "writing discriminant of an uninhabited enum variant")
             }
@@ -1045,14 +1041,6 @@ impl<'tcx, T> InterpResult<'tcx, T> {
     }
 
     #[inline]
-    pub fn map_err_info(
-        self,
-        f: impl FnOnce(InterpErrorInfo<'tcx>) -> InterpErrorInfo<'tcx>,
-    ) -> InterpResult<'tcx, T> {
-        InterpResult::new(self.disarm().map_err(f))
-    }
-
-    #[inline]
     pub fn map_err_kind(
         self,
         f: impl FnOnce(InterpErrorKind<'tcx>) -> InterpErrorKind<'tcx>,
@@ -1064,8 +1052,8 @@ impl<'tcx, T> InterpResult<'tcx, T> {
     }
 
     #[inline]
-    pub fn inspect_err_kind(self, f: impl FnOnce(&InterpErrorKind<'tcx>)) -> InterpResult<'tcx, T> {
-        InterpResult::new(self.disarm().inspect_err(|e| f(&e.0.kind)))
+    pub fn inspect_err_info(self, f: impl FnOnce(&InterpErrorInfo<'tcx>)) -> InterpResult<'tcx, T> {
+        InterpResult::new(self.disarm().inspect_err(f))
     }
 
     #[inline]

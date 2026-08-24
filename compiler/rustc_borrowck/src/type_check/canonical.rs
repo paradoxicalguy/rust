@@ -24,7 +24,7 @@ pub(crate) fn fully_perform_op_raw<'tcx, R: fmt::Debug, Op>(
     body: &Body<'tcx>,
     universal_regions: &UniversalRegions<'tcx>,
     region_bound_pairs: &RegionBoundPairs<'tcx>,
-    known_type_outlives_obligations: &[ty::PolyTypeOutlivesPredicate<'tcx>],
+    known_type_outlives_obligations: &[ty::PolyTypeOutlivesClause<'tcx>],
     constraints: &mut MirTypeckRegionConstraints<'tcx>,
     locations: Locations,
     category: ConstraintCategory<'tcx>,
@@ -131,9 +131,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         category: ConstraintCategory<'tcx>,
     ) {
         self.prove_clause(
-            ty::ClauseKind::Trait(ty::TraitPredicate {
+            ty::ClauseKind::Trait(ty::TraitClause {
                 trait_ref,
-                polarity: ty::PredicatePolarity::Positive,
+                polarity: ty::ClausePolarity::Positive,
             }),
             locations,
             category,

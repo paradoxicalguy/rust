@@ -48,7 +48,6 @@ pub use ena::{snapshot_vec, undo_log, unify};
 // (via `ShardedHashMap`), and because it lets other compiler crates use the
 // lower-level `HashTable` API without a tricky `hashbrown` dependency.
 pub use hashbrown::hash_table;
-pub use limit::Limit;
 pub use rustc_index::static_assert_size;
 // Re-export some data-structure crates which are part of our public API.
 pub use {either, indexmap, smallvec, thin_vec};
@@ -63,7 +62,6 @@ pub mod fx;
 pub mod graph;
 pub mod intern;
 pub mod jobserver;
-mod limit;
 pub mod marker;
 pub mod memmap;
 pub mod obligation_forest;
@@ -77,7 +75,6 @@ pub mod snapshot_map;
 pub mod sorted_map;
 pub mod sso;
 pub mod stable_hash;
-pub mod stack;
 pub mod steal;
 pub mod svh;
 pub mod sync;
