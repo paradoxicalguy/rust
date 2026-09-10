@@ -278,7 +278,7 @@ declare_features! (
     /// Allows some increased flexibility in the name resolution rules,
     /// especially around globs and shadowing (RFC 1560).
     (accepted, item_like_imports, "1.15.0", Some(35120)),
-    // Allows using the `kl` and `widekl` target features and the associated intrinsics
+    /// Allows using the `kl` and `widekl` target features and the associated intrinsics
     (accepted, keylocker_x86, "1.89.0", Some(134813)),
     /// Allows `'a: { break 'a; }`.
     (accepted, label_break_value, "1.65.0", Some(48594)),
@@ -335,6 +335,8 @@ declare_features! (
     (accepted, native_link_modifiers_verbatim, "1.67.0", Some(81490)),
     /// Allows specifying the whole-archive link modifier
     (accepted, native_link_modifiers_whole_archive, "1.61.0", Some(81490)),
+    /// Allows the `!` type.
+    (accepted, never_type, "CURRENT_RUSTC_VERSION", Some(35121)),
     /// Allows using non lexical lifetimes (RFC 2094).
     (accepted, nll, "1.63.0", Some(43234)),
     /// Allows using `#![no_std]`.

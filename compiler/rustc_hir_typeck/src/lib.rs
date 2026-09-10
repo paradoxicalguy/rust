@@ -1,8 +1,8 @@
 // tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(never_type))]
 #![feature(deref_patterns)]
 #![feature(iter_intersperse)]
 #![feature(iter_order_by)]
-#![feature(never_type)]
 #![feature(option_into_flat_iter)]
 #![feature(option_reference_flattening)]
 #![feature(trim_prefix_suffix)]
@@ -392,7 +392,8 @@ fn infer_type_if_missing<'tcx>(fcx: &FnCtxt<'_, 'tcx>, node: Node<'tcx>) -> Opti
                 impl_def_id,
                 impl_trait_ref.args,
             );
-            tcx.check_args_compatible(trait_item_def_id, args)
+            let alias_kind = ty::AliasTermKind::ProjectionConst { def_id: trait_item_def_id };
+            tcx.check_alias_term_args_compatible(alias_kind, args)
                 .then(|| tcx.type_of(trait_item_def_id).instantiate(tcx, args).skip_norm_wip())
         } else {
             Some(fcx.next_ty_var(span))

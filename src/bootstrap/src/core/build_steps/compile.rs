@@ -21,7 +21,7 @@ use tracing::span;
 
 use crate::core::backend::CodegenBackendKind;
 use crate::core::build_steps::gcc::{Gcc, GccOutput, GccTargetPair};
-use crate::core::build_steps::llvm::{LlvmFromCi, prebuilt_llvm_output};
+use crate::core::build_steps::llvm::{LlvmFromCi, LlvmKind, prebuilt_llvm_output};
 use crate::core::build_steps::tool::{RustcPrivateCompilers, SourceType, copy_lld_artifacts};
 use crate::core::build_steps::{dist, llvm};
 use crate::core::builder::{
@@ -33,7 +33,7 @@ use crate::core::config::toml::target::DefaultLinuxLinkerOverride;
 use crate::core::config::{
     Allocator, CompilerBuiltins, DebuginfoLevel, LlvmLibunwind, RustcLto, TargetSelection,
 };
-use crate::core::session::{CLang, DependencyType, FileType, GitRepo, Mode};
+use crate::core::session::{CLang, DependencyType, FileType, Mode};
 use crate::utils::build_stamp;
 use crate::utils::build_stamp::BuildStamp;
 use crate::utils::exec::command;
@@ -439,15 +439,6 @@ fn copy_self_contained_objects(
             )
         });
 
-        // wasm32-wasip3 doesn't exist in wasi-libc yet, so instead use libs
-        // from the wasm32-wasip2 target. Once wasi-libc supports wasip3 this
-        // should be deleted and the native objects should be used.
-        let srcdir = if target == "wasm32-wasip3" {
-            assert!(!srcdir.exists(), "wasip3 support is in wasi-libc, this should be updated now");
-            builder.wasi_libdir(TargetSelection::from_user("wasm32-wasip2")).unwrap()
-        } else {
-            srcdir
-        };
         for &obj in &["libc.a", "crt1-command.o", "crt1-reactor.o"] {
             copy_and_stamp(
                 builder,
@@ -777,8 +768,7 @@ impl Step for StdLink {
         };
 
         let is_downloaded_beta_stage0 = builder
-            .build
-            .config
+            .sess
             .initial_rustc
             .starts_with(builder.out.join(compiler.host).join("stage0/bin"));
 
@@ -1147,7 +1137,7 @@ impl CommandLineStep for Rustc {
             cargo.arg("-p").arg(krate);
         }
 
-        if builder.build.config.enable_bolt_settings && build_compiler.stage == 1 {
+        if builder.sess.config.enable_bolt_settings && build_compiler.stage == 1 {
             // Relocations are required for BOLT to work.
             cargo.env("RUSTC_BOLT_LINK_FLAGS", "1");
         }
@@ -1221,9 +1211,10 @@ pub fn rustc_cargo(
     build_compiler: &Compiler,
     crates: &[String],
 ) {
+    let kind = cargo.kind();
     cargo
         .arg("--features")
-        .arg(builder.rustc_features(builder.kind, target, crates))
+        .arg(builder.rustc_features(kind, target, crates))
         .arg("--manifest-path")
         .arg(builder.src.join("compiler/rustc/Cargo.toml"));
 
@@ -1256,7 +1247,7 @@ pub fn rustc_cargo(
     // us a faster startup time. However GNU ld < 2.40 will error if we try to link a shared object
     // with direct references to protected symbols, so for now we only use protected symbols if
     // linking with LLD is enabled.
-    if builder.build.config.bootstrap_override_lld.is_used() {
+    if builder.sess.config.bootstrap_override_lld.is_used() {
         cargo.rustflag("-Zdefault-visibility=protected");
     }
 
@@ -1317,7 +1308,7 @@ pub fn rustc_cargo(
     rustc_cargo_env(builder, cargo, target);
 }
 
-pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
+fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
     // Set some configuration variables picked up by build scripts and
     // the compiler alike
     cargo
@@ -1386,18 +1377,29 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     //   variables, requiring LLVM to have been built.
     // - For check builds, we want to avoid building LLVM if possible.
     // - Check builds and non-check builds should have the same environment if
-    //   possible, to avoid unnecessary rebuilds due to cache-busting.
+    //   possible, to avoid unnecessary rebuilds due to cache-busting (in the same stage).
     //
-    // Therefore we try to avoid building LLVM for check builds, but only if
-    // building LLVM would be expensive. If "building" LLVM is cheap
-    // (i.e. it's already built or is downloadable), we prefer to maintain a
-    // consistent environment between check and non-check builds.
+    // If we have either:
+    // - LLVM already locally built
+    // - download-ci-llvm enabled
+    // - LLVM provided externally through a llvm-config
+    //
+    // and we do a check-like build, we run rustc_llvm as normally, to maintain a
+    // consistent environment between check and non-check builds
+    //
+    // However, if neither from the above three bullet points is true, and we do a check-like build,
+    // we skip running rustc_llvm by setting the RUST_CHECK environment variable.
+    //
+    // Note that if download-ci-llvm is enabled, `prebuilt_llvm_output` will *eagerly* download
+    // LLVM from CI, thus making it locally available.
     if builder.config.llvm_enabled(target) {
         let building_llvm_is_expensive = prebuilt_llvm_output(builder, target).is_none();
 
-        let skip_llvm = (cargo.kind() == Kind::Check) && building_llvm_is_expensive;
-        if !skip_llvm {
-            rustc_llvm_env(builder, cargo, target)
+        let skip_llvm = cargo.kind().is_check_like() && building_llvm_is_expensive;
+        if skip_llvm {
+            cargo.env("RUST_CHECK", "1");
+        } else {
+            rustc_llvm_env(builder, cargo, target);
         }
     }
 
@@ -1420,7 +1422,7 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
 /// Pass down configuration from the LLVM build into the build of
 /// rustc_llvm and rustc_codegen_llvm.
 ///
-/// Note that this has the side-effect of _building LLVM_, which is sometimes
+/// Note that calling this function has the side-effect of _building LLVM_, which is sometimes
 /// unwanted (e.g. for check builds).
 fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
     let llvm_output = builder.ensure(llvm::Llvm { target });
@@ -1435,7 +1437,8 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
         cargo.env("LLVM_OFFLOAD", "1");
     }
 
-    cargo.env("LLVM_CONFIG", &llvm_output.host_llvm_config);
+    // This always has to be the host LLVM config, because it is executed by rustc_llvm
+    cargo.env("LLVM_CONFIG", builder.host_llvm_config());
 
     // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
     // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by
@@ -1717,7 +1720,6 @@ impl CommandLineStep for GccCodegenBackend {
             Kind::Build,
         );
         cargo.arg("--manifest-path").arg(builder.src.join("compiler/rustc_codegen_gcc/Cargo.toml"));
-        rustc_cargo_env(builder, &mut cargo, host);
 
         let _guard =
             builder.msg(Kind::Build, "codegen backend gcc", Mode::Codegen, build_compiler, host);
@@ -1788,7 +1790,6 @@ impl CommandLineStep for CraneliftCodegenBackend {
         cargo
             .arg("--manifest-path")
             .arg(builder.src.join("compiler/rustc_codegen_cranelift/Cargo.toml"));
-        rustc_cargo_env(builder, &mut cargo, target);
 
         let _guard = builder.msg(
             Kind::Build,
@@ -1902,7 +1903,7 @@ pub fn compiler_file(
     }
     let mut cmd = command(compiler);
     cmd.args(builder.cc_handled_cflags(target, c));
-    cmd.args(builder.cc_unhandled_cflags(target, GitRepo::Rustc, c));
+    cmd.args(builder.cc_unhandled_cflags(target, c));
     cmd.arg(format!("-print-file-name={file}"));
     let out = cmd.run_capture_stdout(builder).stdout();
     PathBuf::from(out.trim())
@@ -2130,7 +2131,8 @@ impl CommandLineStep for Assemble {
             if !builder.config.dry_run() && builder.config.llvm_tools_enabled {
                 trace!("LLVM tools enabled");
 
-                let host_llvm_bin_dir = command(&llvm_output.host_llvm_config)
+                let host_llvm = builder.ensure(llvm::Llvm { target: builder.host_target });
+                let host_llvm_bin_dir = command(host_llvm.llvm_config())
                     .arg("--bindir")
                     .cached()
                     .run_capture_stdout(builder)
@@ -2153,10 +2155,10 @@ impl CommandLineStep for Assemble {
                         // where the LLVM config is located
                         external_llvm_config.parent().unwrap().to_path_buf()
                     } else {
-                        // If we have built LLVM locally, then take the path of the host bindir
+                        // If not, then take the path of the host bindir of the host LLVM,
                         // relative to its output build directory, and then apply it to the target
                         // LLVM output build directory.
-                        let host_llvm_out = builder.llvm_out(builder.host_target);
+                        let host_llvm_out = host_llvm.root_dir();
                         let target_llvm_out = llvm_output.root_dir();
                         if let Ok(relative_path) =
                             Path::new(&host_llvm_bin_dir).strip_prefix(host_llvm_out)
@@ -2188,10 +2190,17 @@ impl CommandLineStep for Assemble {
                     let tool_exe = exe(tool, target_compiler.host);
                     let src_path = llvm_bin_dir.join(&tool_exe);
 
-                    // When using `download-ci-llvm`, some of the tools may not exist, so skip trying to copy them.
-                    if !src_path.exists() && builder.config.llvm_ci_mode.download_from_ci() {
-                        eprintln!("{} does not exist; skipping copy", src_path.display());
-                        continue;
+                    if !src_path.exists() {
+                        // When using `download-ci-llvm`, some of the tools may not exist, so skip trying to copy them.
+                        if llvm_output.kind() == LlvmKind::DownloadedFromCi {
+                            eprintln!("{} does not exist; skipping copy", src_path.display());
+                            continue;
+                        }
+                        // On older LLVM versions, llubi isn't in the default tools. Remove this
+                        // code when LLVM 23 is the minimum version.
+                        if *tool == "llubi" {
+                            continue;
+                        }
                     }
 
                     // There is a chance that these tools are being installed from an external LLVM.
@@ -2285,7 +2294,7 @@ impl CommandLineStep for Assemble {
 
         if builder.config.llvm_offload && !builder.config.dry_run() {
             debug!("`llvm_offload` requested");
-            if let Some(_llvm_config) = builder.llvm_config(builder.config.host_target) {
+            if builder.is_llvm_enabled_for(builder.config.host_target) {
                 let rust_offload =
                     builder.ensure(llvm::RustOffload { target: build_compiler.host });
                 let target_libdir =
@@ -2511,7 +2520,8 @@ impl CommandLineStep for Assemble {
         }
 
         // In addition to `rust-lld` also install `wasm-component-ld` when
-        // is enabled. This is used by the `wasm32-wasip2` target of Rust.
+        // is enabled. This is used by targets that produce WebAssembly
+        // components in Rust such as `wasm32-wasip{2,3}`.
         if builder.tool_enabled("wasm-component-ld") {
             let wasm_component = builder.ensure(
                 crate::core::build_steps::tool::WasmComponentLd::for_use_by_compiler(

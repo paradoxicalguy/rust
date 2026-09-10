@@ -265,7 +265,6 @@ impl<'db> InferenceContext<'db> {
             | Expr::Assignment { .. }
             | Expr::Yield { .. }
             | Expr::Cast { .. }
-            | Expr::Unsafe { .. }
             | Expr::Await { .. }
             | Expr::Ref { .. }
             | Expr::RecordLit { .. }
@@ -391,11 +390,8 @@ impl<'db> InferenceContext<'db> {
                 );
                 self.types.types.bool
             }
-            Expr::Block { statements, tail, label, id: _ } => {
+            Expr::Block { statements, tail, label, id: _, unsafe_: _ } => {
                 self.infer_block(tgt_expr, statements, *tail, *label, expected)
-            }
-            Expr::Unsafe { id: _, statements, tail } => {
-                self.infer_block(tgt_expr, statements, *tail, None, expected)
             }
             Expr::Const(id) => {
                 self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
@@ -617,7 +613,7 @@ impl<'db> InferenceContext<'db> {
             Expr::Field { expr, name } => self.infer_field_access(tgt_expr, *expr, name, expected),
             Expr::Await { expr } => self.infer_await_expr(tgt_expr, *expr),
             Expr::Cast { expr, type_ref } => {
-                let cast_ty = self.make_body_ty(*type_ref);
+                let cast_ty = self.make_ty(*type_ref);
                 let expr_ty =
                     self.infer_expr(*expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
                 self.deferred_cast_checks.push(CastCheck::new(tgt_expr, *expr, expr_ty, cast_ty));
@@ -821,7 +817,7 @@ impl<'db> InferenceContext<'db> {
                     }
                 };
 
-                let diverge = asm.options.contains(AsmOptions::NORETURN);
+                let mut diverge = asm.options.contains(AsmOptions::NORETURN);
                 asm.operands.iter().for_each(|(_, operand)| match *operand {
                     AsmOperand::In { expr, .. } => check_expr_asm_operand(self, expr, true),
                     AsmOperand::Out { expr: Some(expr), .. } | AsmOperand::InOut { expr, .. } => {
@@ -835,11 +831,19 @@ impl<'db> InferenceContext<'db> {
                         }
                     }
                     AsmOperand::Label(expr) => {
-                        self.infer_expr(
+                        let previous_diverges = self.diverges;
+                        // The label blocks should have unit return value or diverge.
+                        let ty = self.infer_expr_inner(
                             expr,
                             &Expectation::HasType(self.types.types.unit),
                             ExprIsRead::No,
                         );
+                        if !ty.is_never() {
+                            _ = self.demand_suptype(expr.into(), self.types.types.unit, ty);
+                            diverge = false;
+                        }
+                        // We need this to avoid false unreachable warning when a label diverges.
+                        self.diverges = previous_diverges;
                     }
                     AsmOperand::Const(expr) => {
                         self.infer_expr(expr, &Expectation::None, ExprIsRead::No);
@@ -1306,7 +1310,7 @@ impl<'db> InferenceContext<'db> {
         expr: ExprId,
     ) -> Ty<'db> {
         let interner = self.interner();
-        let count_ct = self.create_body_anon_const(count, self.types.types.usize, true);
+        let count_ct = self.create_anon_const(count, self.types.types.usize, true);
         let count = self.table.try_structurally_resolve_const(count.into(), count_ct);
 
         let uty = match expected {
@@ -1321,7 +1325,11 @@ impl<'db> InferenceContext<'db> {
             }
             None => {
                 let ty = self.table.next_ty_var(element.into());
-                self.infer_expr(element, &Expectation::has_type(ty), ExprIsRead::Yes);
+                self.infer_expr_suptype_coerce_never(
+                    element,
+                    &Expectation::has_type(ty),
+                    ExprIsRead::Yes,
+                );
                 ty
             }
         };
@@ -1468,7 +1476,7 @@ impl<'db> InferenceContext<'db> {
                         Statement::Let { pat, type_ref, initializer, else_branch } => {
                             let decl_ty = type_ref
                                 .as_ref()
-                                .map(|&tr| this.make_body_ty(tr))
+                                .map(|&tr| this.make_ty(tr))
                                 .unwrap_or_else(|| this.table.next_ty_var((*pat).into()));
 
                             this.infer_let(

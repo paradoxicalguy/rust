@@ -7,7 +7,7 @@ use rustc_infer::traits::PredicateObligations;
 use rustc_macros::extension;
 pub use rustc_middle::traits::query::NormalizationResult;
 use rustc_middle::ty::{
-    self, FallibleTypeFolder, Flags, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
+    self, FallibleTypeFolder, Flags, PredicateProxy, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
     TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, Unnormalized,
 };
 use rustc_span::DUMMY_SP;
@@ -290,10 +290,10 @@ impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
     }
 
     #[inline]
-    fn try_fold_predicate(
+    fn try_fold_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(
         &mut self,
-        p: ty::Predicate<'tcx>,
-    ) -> Result<ty::Predicate<'tcx>, Self::Error> {
+        p: P,
+    ) -> Result<P, Self::Error> {
         if p.allow_normalization() && needs_normalization(self.infcx, &p) {
             p.try_super_fold_with(self)
         } else {
@@ -331,7 +331,9 @@ impl<'a, 'tcx> QueryNormalizer<'a, 'tcx> {
             ty::AliasTermKind::FreeTy { .. } | ty::AliasTermKind::FreeConst { .. } => {
                 tcx.normalize_canonicalized_free_alias(c_term)
             }
-            ty::AliasTermKind::InherentTy { .. } | ty::AliasTermKind::InherentConst { .. } => {
+            ty::AliasTermKind::InherentTy { .. }
+            | ty::AliasTermKind::InherentConstSelf { .. }
+            | ty::AliasTermKind::InherentConstImpl { .. } => {
                 tcx.normalize_canonicalized_inherent_projection(c_term)
             }
             kind @ (ty::AliasTermKind::OpaqueTy { .. } | ty::AliasTermKind::AnonConst { .. }) => {

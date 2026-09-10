@@ -17,11 +17,15 @@ use tracing::instrument;
 use self::derive_errors::*;
 use super::Certainty;
 use super::delegate::SolverDelegate;
-use crate::traits::{FulfillmentError, ScrubbedTraitError};
+use crate::traits::{FulfillmentError, FulfillmentErrorCode, ScrubbedTraitError};
 
 mod derive_errors;
 
-// FIXME: Do we need to use a `ThinVec` here?
+// `ThinVec` is important for performance, but not for the usual memory layout reasons.
+// `try_evaluate_obligations` is extremely hot and uses `retain_mut`. `ThinVec::retain_mut` is
+// simple and sub-optimal in terms of how it moves elements, but it can be inlined.
+// `Vec::retain_mut` is more sophisticated and minimizes element moves, but also contains more code
+// and doesn't get inlined in `try_evaluate_obligations`, giving worse performance overall.
 type PendingObligations<'tcx> =
     ThinVec<(PredicateObligation<'tcx>, Option<GoalStalledOn<TyCtxt<'tcx>>>)>;
 
@@ -187,7 +191,8 @@ where
             // the other case.
             TraitErrors::NoErrors
         } else {
-            TraitErrors::HasErrors(collect_remaining_errors_impl(self, infcx))
+            let errors = collect_remaining_errors_impl(self, infcx);
+            TraitErrors::from_iter(errors.into_iter())
         }
     }
 
@@ -401,7 +406,9 @@ where
     cx.obligations
         .pending
         .drain(..)
-        .map(|(obligation, _)| NextSolverError::Ambiguity(obligation))
+        .filter_map(|(obligation, _)| {
+            try_ambiguity_error_for_stalled(infcx, obligation).map(NextSolverError::Ambiguity)
+        })
         .chain(
             cx.obligations
                 .overflowed
@@ -412,9 +419,19 @@ where
         .collect()
 }
 
+// We evaluate stalled obligations while collecting remaining errors because a
+// previously ambiguous goal may have become successful. In that case we emit a
+// delayed bug instead of producing a fulfillment error. Store the diagnostic
+// information here so error conversion does not reevaluate the goal.
+pub struct NextSolverAmbiguityError<'tcx> {
+    root_obligation: PredicateObligation<'tcx>,
+    code: FulfillmentErrorCode<'tcx>,
+    refine_obligation: bool,
+}
+
 pub enum NextSolverError<'tcx> {
     TrueError(PredicateObligation<'tcx>),
-    Ambiguity(PredicateObligation<'tcx>),
+    Ambiguity(NextSolverAmbiguityError<'tcx>),
     Overflow(PredicateObligation<'tcx>),
 }
 
@@ -424,8 +441,8 @@ impl<'tcx> FromSolverError<'tcx, NextSolverError<'tcx>> for FulfillmentError<'tc
             NextSolverError::TrueError(obligation) => {
                 fulfillment_error_for_no_solution(infcx, obligation)
             }
-            NextSolverError::Ambiguity(obligation) => {
-                fulfillment_error_for_stalled(infcx, obligation)
+            NextSolverError::Ambiguity(ambiguity) => {
+                fulfillment_error_for_stalled(infcx, ambiguity)
             }
             NextSolverError::Overflow(obligation) => {
                 fulfillment_error_for_overflow(infcx, obligation)
@@ -453,7 +470,9 @@ mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
     // Before #160005 this pair was greater than 128 bytes, which triggered the use of (slow)
-    // `memcpy` for moving elements of `PendingObligations`.
+    // `memcpy` for moving elements of `PendingObligations`. Then #160479 greatly reduced the
+    // number of `memcpy` operations in `try_evaluate_obligations`. So the size of this pair is
+    // much less important than it was, but still shouldn't be changed without some thought.
     static_assert_size!((PredicateObligation<'_>, Option<GoalStalledOn<TyCtxt<'_>>>), 104);
     // tidy-alphabetical-end
 }

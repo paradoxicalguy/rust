@@ -225,7 +225,7 @@ pub trait PointeeSized {
 ///
 /// [`ops::CoerceUnsized`]: crate::ops::CoerceUnsized
 /// [`Rc`]: ../../std/rc/struct.Rc.html
-/// [RFC982]: https://github.com/rust-lang/rfcs/blob/master/text/0982-dst-coercion.md
+/// [RFC982]: https://rust-lang.github.io/rfcs/0982-dst-coercion.html
 /// [nomicon-coerce]: ../../nomicon/coercions.html
 /// [^1]: Formerly known as *object safe*.
 #[unstable(feature = "unsize", issue = "18598")]
@@ -480,7 +480,7 @@ marker_impls! {
 
 }
 
-#[unstable(feature = "never_type", issue = "35121")]
+#[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
 impl Copy for ! {}
 
 /// Shared references can be copied, but mutable references *cannot*!

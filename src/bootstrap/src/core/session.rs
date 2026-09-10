@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 use std::{env, fs, io, str};
 
@@ -18,6 +18,7 @@ use crate::core::builder::{Builder, Kind};
 use crate::core::compiler::Compiler;
 use crate::core::config::flags::{self, Subcommand};
 use crate::core::config::{BootstrapOverrideLld, Config, DryRun, LlvmLibunwind, TargetSelection};
+use crate::core::download::{DownloadContext, download_beta_toolchain};
 use crate::core::metadata::Crate;
 #[cfg(feature = "tracing")]
 use crate::trace_io;
@@ -30,51 +31,23 @@ use crate::utils::helpers::{
 };
 use crate::{debug, trace};
 
-pub(crate) enum GitRepo {
-    Rustc,
-    Llvm,
-}
-
 /// Global configuration for the build system.
 ///
 /// This structure transitively contains all configuration for the build system.
 /// All filesystem-encoded configuration is in `config`, all flags are in
 /// `flags`, and then parsed or probed information is listed in the keys below.
-///
-/// This structure is a parameter of almost all methods in the build system,
-/// although most functions are implemented as free functions rather than
-/// methods specifically on this structure itself (to make it easier to
-/// organize).
-pub(crate) struct Build {
-    /// User-specified configuration from `bootstrap.toml`.
+pub(crate) struct Session {
+    /// User-specified configuration from command-line flags and `bootstrap.toml`.
     pub(crate) config: Config,
 
     // Version information
     pub(crate) version: String,
 
     // Properties derived from the above configuration
-    pub(crate) src: PathBuf,
-    pub(crate) out: PathBuf,
     pub(crate) bootstrap_out: PathBuf,
-    pub(crate) cargo_info: GitInfo,
-    pub(crate) rust_analyzer_info: GitInfo,
-    pub(crate) clippy_info: GitInfo,
-    pub(crate) miri_info: GitInfo,
-    pub(crate) rustfmt_info: GitInfo,
-    pub(crate) enzyme_info: GitInfo,
-    pub(crate) in_tree_llvm_info: GitInfo,
-    pub(crate) in_tree_gcc_info: GitInfo,
-    pub(crate) local_rebuild: bool,
     pub(crate) fail_fast: bool,
     pub(crate) test_target: TestTarget,
     pub(crate) verbosity: usize,
-
-    /// Build triple for the pre-compiled snapshot compiler.
-    pub(crate) host_target: TargetSelection,
-    /// Which triples to produce a compiler toolchain for.
-    pub(crate) hosts: Vec<TargetSelection>,
-    /// Which triples to build libraries (core/alloc/std/test/proc_macro) for.
-    pub(crate) targets: Vec<TargetSelection>,
 
     pub(crate) initial_rustc: PathBuf,
     pub(crate) initial_rustdoc: PathBuf,
@@ -103,6 +76,14 @@ pub(crate) struct Build {
 
     #[cfg(feature = "tracing")]
     pub(crate) step_graph: std::cell::RefCell<crate::utils::step_graph::StepGraph>,
+}
+
+impl Deref for Session {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
 }
 
 /// When building Rust various objects are handled differently.
@@ -228,8 +209,8 @@ impl FileType {
 }
 
 macro_rules! forward {
-    ( $( $fn:ident( $($param:ident: $ty:ty),* ) $( -> $ret:ty)? ),+ $(,)? ) => {
-        impl Build {
+    ($( $fn:ident( $($param:ident: $ty:ty),* ) $( -> $ret:ty)? ),+ $(,)? ) => {
+        impl Session {
             $(
                 pub(crate) fn $fn(&self, $($param: $ty),* ) $( -> $ret)? {
                     self.config.$fn( $($param),* )
@@ -267,15 +248,12 @@ impl From<Compiler> for TargetAndStage {
     }
 }
 
-impl Build {
+impl Session {
     /// Creates a new set of build configuration from the `flags` on the command
     /// line and the filesystem `config`.
     ///
     /// By default all build output will be placed in the current directory.
-    pub(crate) fn new(mut config: Config) -> Build {
-        let src = config.src.clone();
-        let out = config.out.clone();
-
+    pub(crate) fn new(mut config: Config) -> Session {
         #[cfg(unix)]
         // keep this consistent with the equivalent check in x.py:
         // https://github.com/rust-lang/rust/blob/a8a33cf27166d3eabaffc58ed3799e054af3b0c6/src/bootstrap/bootstrap.py#L796-L797
@@ -293,27 +271,54 @@ impl Build {
         #[cfg(not(unix))]
         let is_sudo = false;
 
-        let rust_info = config.rust_info.clone();
-        let cargo_info = config.cargo_info.clone();
-        let rust_analyzer_info = config.rust_analyzer_info.clone();
-        let clippy_info = config.clippy_info.clone();
-        let miri_info = config.miri_info.clone();
-        let rustfmt_info = config.rustfmt_info.clone();
-        let enzyme_info = config.enzyme_info.clone();
-        let in_tree_llvm_info = config.in_tree_llvm_info.clone();
-        let in_tree_gcc_info = config.in_tree_gcc_info.clone();
+        let dwn_ctx = DownloadContext::from(&config);
 
-        let initial_target_libdir = command(&config.initial_rustc)
+        let initial_rustc = config.external_rustc.clone().unwrap_or_else(|| {
+            download_beta_toolchain(&dwn_ctx, &config.out);
+            config
+                .out
+                .join(config.host_target)
+                .join("stage0")
+                .join("bin")
+                .join(exe("rustc", config.host_target))
+        });
+
+        let initial_rustdoc = config
+            .external_rustdoc
+            .clone()
+            .unwrap_or_else(|| initial_rustc.with_file_name(exe("rustdoc", config.host_target)));
+
+        // Gather both the sysroot and the target libdir to avoid an unnecessary rustc execution
+        // and speed up bootstrap slightly.
+        let rustc_paths = command(&initial_rustc)
+            .args(["--print", "sysroot", "--print", "target-libdir"])
             .run_in_dry_run()
-            .args(["--print", "target-libdir"])
             .run_capture_stdout(&config)
-            .stdout()
-            .trim()
-            .to_owned();
+            .stdout();
+        let mut rustc_paths = rustc_paths.lines();
+        let initial_sysroot =
+            rustc_paths.next().map(PathBuf::from).expect("Missing sysroot from initial rustc");
+        let initial_target_libdir = rustc_paths
+            .next()
+            .map(PathBuf::from)
+            .expect("Missing target libdir from initial rustc");
+        assert!(rustc_paths.next().is_none());
 
-        let initial_target_dir = Path::new(&initial_target_libdir)
+        let initial_cargo = config.external_cargo.clone().unwrap_or_else(|| {
+            download_beta_toolchain(&dwn_ctx, &config.out);
+            initial_sysroot.join("bin").join(exe("cargo", config.host_target))
+        });
+
+        // NOTE: it's important this comes *after* we potentially download the binaries above,
+        // in order to not redownload them into a temporary directory.
+        if config.exec_ctx.dry_run() {
+            config.out = config.out.join("tmp-dry-run");
+            fs::create_dir_all(&config.out).expect("Failed to create dry-run directory");
+        }
+
+        let initial_target_dir = initial_target_libdir
             .parent()
-            .unwrap_or_else(|| panic!("{initial_target_libdir} has no parent"));
+            .unwrap_or_else(|| panic!("{initial_target_libdir:?} has no parent"));
 
         let initial_lld = initial_target_dir.join("bin").join("rust-lld");
 
@@ -326,7 +331,7 @@ impl Build {
             });
 
             ancestor
-                .strip_prefix(&config.initial_sysroot)
+                .strip_prefix(&initial_sysroot)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Couldn’t resolve the initial relative libdir from {}",
@@ -336,7 +341,7 @@ impl Build {
                 .to_path_buf()
         };
 
-        let version = std::fs::read_to_string(src.join("src").join("version"))
+        let version = std::fs::read_to_string(config.src.join("src").join("version"))
             .expect("failed to read src/version");
         let version = version.trim();
 
@@ -358,40 +363,24 @@ impl Build {
             )
         }
 
-        if rust_info.is_from_tarball() && config.description.is_none() {
+        if config.rust_info.is_from_tarball() && config.description.is_none() {
             config.description = Some("built from a source tarball".to_owned());
         }
 
-        let mut build = Build {
+        let mut sess = Session {
             initial_lld,
             initial_relative_libdir,
-            initial_rustc: config.initial_rustc.clone(),
-            initial_rustdoc: config.initial_rustdoc.clone(),
-            initial_cargo: config.initial_cargo.clone(),
-            initial_sysroot: config.initial_sysroot.clone(),
-            local_rebuild: config.local_rebuild,
+            initial_rustc,
+            initial_rustdoc,
+            initial_cargo,
+            initial_sysroot,
             fail_fast: config.cmd.fail_fast(),
             test_target: config.cmd.test_target(),
             verbosity: config.exec_ctx.verbosity as usize,
-
-            host_target: config.host_target,
-            hosts: config.hosts.clone(),
-            targets: config.targets.clone(),
-
             config,
             version: version.to_string(),
-            src,
-            out,
             bootstrap_out,
 
-            cargo_info,
-            rust_analyzer_info,
-            clippy_info,
-            miri_info,
-            rustfmt_info,
-            enzyme_info,
-            in_tree_llvm_info,
-            in_tree_gcc_info,
             cc: HashMap::new(),
             cxx: HashMap::new(),
             ar: HashMap::new(),
@@ -411,10 +400,10 @@ impl Build {
 
         // If local-rust is the same major.minor as the current version, then force a
         // local-rebuild
-        let local_version_verbose = command(&build.initial_rustc)
+        let local_version_verbose = command(&sess.initial_rustc)
             .run_in_dry_run()
             .args(["--version", "--verbose"])
-            .run_capture_stdout(&build)
+            .run_capture_stdout(&sess)
             .stdout();
         let local_release = local_version_verbose
             .lines()
@@ -423,26 +412,26 @@ impl Build {
             .unwrap()
             .trim();
         if local_release.split('.').take(2).eq(version.split('.').take(2)) {
-            build.do_if_verbose(|| println!("auto-detected local-rebuild {local_release}"));
-            build.local_rebuild = true;
+            sess.do_if_verbose(|| println!("auto-detected local-rebuild {local_release}"));
+            sess.config.local_rebuild = true;
         }
 
-        build.do_if_verbose(|| println!("finding compilers"));
-        crate::utils::cc_detect::fill_compilers(&mut build);
+        sess.do_if_verbose(|| println!("finding compilers"));
+        crate::utils::cc_detect::fill_compilers(&mut sess);
         // When running `setup`, the profile is about to change, so any requirements we have now may
         // be different on the next invocation. Don't check for them until the next time x.py is
         // run. This is ok because `setup` never runs any build commands, so it won't fail if commands are missing.
         //
         // Similarly, for `setup` we don't actually need submodules or cargo metadata.
-        if !matches!(build.config.cmd, Subcommand::Setup { .. }) {
-            build.do_if_verbose(|| println!("running sanity check"));
-            crate::core::sanity::check(&mut build);
+        if !matches!(sess.config.cmd, Subcommand::Setup { .. }) {
+            sess.do_if_verbose(|| println!("running sanity check"));
+            crate::core::sanity::check(&mut sess);
 
             // Make sure we update these before gathering metadata so we don't get an error about missing
             // Cargo.toml files.
             let rust_submodules = ["library/backtrace"];
             for s in rust_submodules {
-                build.require_submodule(
+                sess.require_submodule(
                     s,
                     Some(
                         "The submodule is required for the standard library \
@@ -451,30 +440,30 @@ impl Build {
                 );
             }
             // Now, update all existing submodules.
-            build.update_existing_submodules();
+            sess.update_existing_submodules();
 
-            build.do_if_verbose(|| println!("learning about cargo"));
-            crate::core::metadata::build(&mut build);
+            sess.do_if_verbose(|| println!("learning about cargo"));
+            crate::core::metadata::build(&mut sess);
         }
 
         // Create symbolic link to use host sysroot from a consistent path (e.g., in the rust-analyzer config file).
-        let build_triple = build.out.join(build.host_target);
+        let build_triple = sess.out.join(sess.host_target);
         t!(fs::create_dir_all(&build_triple));
-        let host = build.out.join("host");
+        let host = sess.out.join("host");
         if host.is_symlink() {
             // Left over from a previous build; overwrite it.
-            // This matters if `build.build` has changed between invocations.
+            // This matters if `sess.host_target` has changed between invocations.
             #[cfg(windows)]
             t!(fs::remove_dir(&host));
             #[cfg(not(windows))]
             t!(fs::remove_file(&host));
         }
         t!(
-            symlink_dir(&build.config, &build_triple, &host),
+            symlink_dir(&sess.config, &build_triple, &host),
             format!("symlink_dir({} => {}) failed", host.display(), build_triple.display())
         );
 
-        build
+        sess
     }
 
     /// Updates a submodule, and exits with a failure if submodule management
@@ -489,10 +478,10 @@ impl Build {
         feature = "tracing",
         instrument(
             level = "trace",
-            name = "Build::require_submodule",
+            name = "Session::require_submodule",
             skip_all,
             fields(submodule = submodule),
-        ),
+        )
     )]
     pub(crate) fn require_submodule(&self, submodule: &str, err_hint: Option<&str>) {
         if self.rust_info().is_from_tarball() {
@@ -567,7 +556,7 @@ impl Build {
     }
 
     /// Executes the entire build, as configured by the flags and configuration.
-    #[cfg_attr(feature = "tracing", instrument(level = "debug", name = "Build::build", skip_all))]
+    #[cfg_attr(feature = "tracing", instrument(level = "debug", name = "Session::build", skip_all))]
     pub(crate) fn build(&mut self) {
         trace!("setting up job management");
         unsafe {
@@ -597,7 +586,11 @@ impl Build {
                     );
                 }
                 Subcommand::Perf(args) => {
-                    return crate::core::build_steps::perf::perf(&Builder::new(self), args);
+                    return crate::core::build_steps::perf::perf(
+                        &Builder::new(self),
+                        args,
+                        &self.config.free_args,
+                    );
                 }
                 _cmd => {
                     debug!(cmd = ?_cmd, "not a hardcoded subcommand; returning to normal handling");
@@ -703,7 +696,7 @@ impl Build {
         {
             features.push(allocator_feature_name);
         }
-        if (self.config.llvm_enabled(target) || kind == Kind::Check) && check("llvm") {
+        if self.config.llvm_enabled(target) && check("llvm") {
             features.push("llvm");
         }
         if self.config.llvm_offload {
@@ -713,7 +706,7 @@ impl Build {
         if self.config.rust_randomize_layout && check("rustc_randomized_layouts") {
             features.push("rustc_randomized_layouts");
         }
-        if self.config.compile_time_deps && kind == Kind::Check {
+        if self.config.compile_time_deps && kind.is_check_like() {
             features.push("check_only");
         }
 
@@ -817,18 +810,9 @@ impl Build {
         self.out.join(target).join("json-doc")
     }
 
-    pub(crate) fn test_out(&self, target: TargetSelection) -> PathBuf {
-        self.out.join(target).join("test")
-    }
-
     /// Output directory for all documentation for a target
     pub(crate) fn compiler_doc_out(&self, target: TargetSelection) -> PathBuf {
         self.out.join(target).join("compiler-doc")
-    }
-
-    /// Output directory for some generated md crate documentation for a target (temporary)
-    pub(crate) fn md_doc_out(&self, target: TargetSelection) -> PathBuf {
-        self.out.join(target).join("md-doc")
     }
 
     /// Path to the vendored Rust crates.
@@ -839,12 +823,6 @@ impl Build {
     /// Directory for libraries built from C/C++ code and shared between stages.
     pub(crate) fn native_dir(&self, target: TargetSelection) -> PathBuf {
         self.out.join(target).join("native")
-    }
-
-    /// Root output directory for rust_test_helpers library compiled for
-    /// `target`
-    pub(crate) fn test_helpers_out(&self, target: TargetSelection) -> PathBuf {
-        self.native_dir(target).join("rust-test-helpers")
     }
 
     /// Adds the `RUST_TEST_THREADS` env var if necessary
@@ -861,17 +839,7 @@ impl Build {
 
     /// Returns the sysroot of the snapshot compiler.
     pub(crate) fn rustc_snapshot_sysroot(&self) -> &Path {
-        static SYSROOT_CACHE: OnceLock<PathBuf> = OnceLock::new();
-        SYSROOT_CACHE.get_or_init(|| {
-            command(&self.initial_rustc)
-                .run_in_dry_run()
-                .args(["--print", "sysroot"])
-                .run_capture_stdout(self)
-                .stdout()
-                .trim()
-                .to_owned()
-                .into()
-        })
+        &self.initial_sysroot
     }
 
     pub(crate) fn info(&self, msg: &str) {
@@ -885,7 +853,7 @@ impl Build {
 
     /// Return a `Group` guard for a [`Step`] that:
     /// - Performs `action`
-    ///   - If the action is `Kind::Test`, use [`Build::msg_test`] instead.
+    ///   - If the action is `Kind::Test`, use [`Session::msg_test`] instead.
     /// - On `what`
     ///   - Where `what` possibly corresponds to a `mode`
     /// - `action` is performed with/on the given compiler (`target_and_stage`).
@@ -908,7 +876,7 @@ impl Build {
         let action = action.into();
         assert!(
             action != Kind::Test,
-            "Please use `Build::msg_test` instead of `Build::msg(Kind::Test)`"
+            "Please use `Session::msg_test` instead of `Session::msg(Kind::Test)`"
         );
 
         let actual_stage = match mode.into() {
@@ -947,7 +915,7 @@ impl Build {
     }
 
     /// Return a `Group` guard for a [`Step`] that tests `what` with the given `stage` and `target`.
-    /// Use this instead of [`Build::msg`] for test steps, because for them it is not always clear
+    /// Use this instead of [`Session::msg`] for test steps, because for them it is not always clear
     /// what exactly is a build compiler.
     ///
     /// [`Step`]: crate::core::builder::Step
@@ -996,38 +964,29 @@ impl Build {
         })
     }
 
-    pub(crate) fn debuginfo_map_to(
-        &self,
-        which: GitRepo,
-        remap_scheme: RemapScheme,
-    ) -> Option<String> {
+    pub(crate) fn debuginfo_map_to(&self, remap_scheme: RemapScheme) -> Option<String> {
         if !self.config.rust_remap_debuginfo {
             return None;
         }
 
-        match which {
-            GitRepo::Rustc => {
-                let sha = self.rust_sha().unwrap_or(&self.version);
+        let sha = self.rust_sha().unwrap_or(&self.version);
 
-                match remap_scheme {
-                    RemapScheme::Compiler => {
-                        // For compiler sources, remap via `/rustc-dev/{sha}` to allow
-                        // distinguishing between compiler sources vs library sources, since
-                        // `rustc-dev` dist component places them under
-                        // `$sysroot/lib/rustlib/rustc-src/rust` as opposed to `rust-src`'s
-                        // `$sysroot/lib/rustlib/src/rust`.
-                        //
-                        // Keep this scheme in sync with `rustc_metadata::rmeta::decoder`'s
-                        // `try_to_translate_virtual_to_real`.
-                        Some(format!("/rustc-dev/{sha}"))
-                    }
-                    RemapScheme::NonCompiler => {
-                        // For non-compiler sources, use `/rustc/{sha}` remapping scheme.
-                        Some(format!("/rustc/{sha}"))
-                    }
-                }
+        match remap_scheme {
+            RemapScheme::Compiler => {
+                // For compiler sources, remap via `/rustc-dev/{sha}` to allow
+                // distinguishing between compiler sources vs library sources, since
+                // `rustc-dev` dist component places them under
+                // `$sysroot/lib/rustlib/rustc-src/rust` as opposed to `rust-src`'s
+                // `$sysroot/lib/rustlib/src/rust`.
+                //
+                // Keep this scheme in sync with `rustc_metadata::rmeta::decoder`'s
+                // `try_to_translate_virtual_to_real`.
+                Some(format!("/rustc-dev/{sha}"))
             }
-            GitRepo::Llvm => Some(String::from("/rustc/llvm")),
+            RemapScheme::NonCompiler => {
+                // For non-compiler sources, use `/rustc/{sha}` remapping scheme.
+                Some(format!("/rustc/{sha}"))
+            }
         }
     }
 
@@ -1070,12 +1029,7 @@ impl Build {
     }
 
     /// Returns extra C flags that `cc-rs` doesn't handle.
-    pub(crate) fn cc_unhandled_cflags(
-        &self,
-        target: TargetSelection,
-        which: GitRepo,
-        c: CLang,
-    ) -> Vec<String> {
+    pub(crate) fn cc_unhandled_cflags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
         let mut base = Vec::new();
 
         // If we're compiling C++ on macOS then we add a flag indicating that
@@ -1092,16 +1046,6 @@ impl Build {
             base.push("-fno-omit-frame-pointer".into());
         }
 
-        if let Some(map_to) = self.debuginfo_map_to(which, RemapScheme::NonCompiler) {
-            let map = format!("{}={}", self.src.display(), map_to);
-            let cc = self.cc_tool(target);
-            if cc.is_like_clang() || cc.is_like_gnu() {
-                base.push(format!("-fdebug-prefix-map={map}"));
-            } else if cc.is_like_clang_cl() {
-                base.push("-Xclang".into());
-                base.push(format!("-fdebug-prefix-map={map}"));
-            }
-        }
         base
     }
 
@@ -1311,11 +1255,6 @@ impl Build {
     /// emulated with QEMU and binaries will need to be shipped to the emulator.
     pub(crate) fn qemu_rootfs(&self, target: TargetSelection) -> Option<&Path> {
         self.config.target_config.get(&target).and_then(|t| t.qemu_rootfs.as_ref()).map(|p| &**p)
-    }
-
-    /// Temporary directory that extended error information is emitted to.
-    pub(crate) fn extended_error_dir(&self) -> PathBuf {
-        self.out.join("tmp/extended-error-metadata")
     }
 
     /// Tests whether the `compiler` compiling for `target` should be forced to
@@ -1868,7 +1807,7 @@ to download LLVM rather than building it.
     }
 }
 
-impl AsRef<ExecutionContext> for Build {
+impl AsRef<ExecutionContext> for Session {
     fn as_ref(&self) -> &ExecutionContext {
         &self.config.exec_ctx
     }
