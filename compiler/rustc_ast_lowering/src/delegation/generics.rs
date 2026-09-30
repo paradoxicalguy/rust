@@ -191,7 +191,11 @@ impl<'hir> HirOrTyGenerics<'hir> {
                 .data
                 .iter()
                 .flat_map(|slot| match slot {
-                    GenericArgSlot::Generate(_, Some(idx)) => Some(*idx),
+                    GenericArgSlot::Generate(param, Some(idx))
+                        if param.name != kw::SelfUpper && !param.kind.is_synthetic() =>
+                    {
+                        Some(*idx)
+                    }
                     _ => None,
                 })
                 .collect(),

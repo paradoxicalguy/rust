@@ -1,0 +1,15 @@
+error: expected identifier, found keyword `Self`
+  --> $DIR/arg-must-exist-for-infer.rs:5:19
+   |
+LL | trait Trait<const Self: usize = 2> {
+   |                   ^^^^ expected identifier, found keyword
+
+error[E0121]: the placeholder `_` is not allowed within types on item signatures for associated functions
+  --> $DIR/arg-must-exist-for-infer.rs:11:19
+   |
+LL |     reuse Trait::<_>::foo;
+   |                   ^ not allowed in type signatures
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0121`.
