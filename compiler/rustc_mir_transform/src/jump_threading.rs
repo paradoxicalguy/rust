@@ -57,7 +57,6 @@ use rustc_const_eval::interpret::{ImmTy, Immediate, InterpCx, OpTy, Projectable}
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
 use rustc_index::IndexVec;
 use rustc_index::bit_set::{DenseBitSet, GrowableBitSet};
-use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
@@ -65,7 +64,7 @@ use rustc_middle::ty::{self, ScalarInt, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{
     Map, PlaceCollectionMode, PlaceIndex, TrackElem, ValueIndex,
 };
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, bug};
 use tracing::{debug, instrument, trace};
 
 use crate::PassPolicy;
@@ -1050,7 +1049,7 @@ impl<'a, 'tcx> OpportunitySet<'a, 'tcx> {
 
     #[instrument(level = "debug", skip(self))]
     fn apply_goto(&mut self, bb: BasicBlock, target: BasicBlock) {
-        self.basic_blocks[bb].terminator_mut().kind = TerminatorKind::Goto { target };
+        self.basic_blocks[bb].terminator_mut().kind = TerminatorKind::goto(target);
     }
 
     #[instrument(level = "debug", skip(self), ret)]

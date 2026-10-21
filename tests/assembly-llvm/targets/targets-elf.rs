@@ -43,6 +43,9 @@
 //@ revisions: aarch64_unknown_hermit
 //@ [aarch64_unknown_hermit] compile-flags: --target aarch64-unknown-hermit
 //@ [aarch64_unknown_hermit] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_hyperlight
+//@ [aarch64_unknown_hyperlight] compile-flags: --target aarch64-unknown-hyperlight
+//@ [aarch64_unknown_hyperlight] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_illumos
 //@ [aarch64_unknown_illumos] compile-flags: --target aarch64-unknown-illumos
 //@ [aarch64_unknown_illumos] needs-llvm-components: aarch64
@@ -103,6 +106,9 @@
 //@ revisions: aarch64_unknown_teeos
 //@ [aarch64_unknown_teeos] compile-flags: --target aarch64-unknown-teeos
 //@ [aarch64_unknown_teeos] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_qtee
+//@ [aarch64_unknown_qtee] compile-flags: --target aarch64-unknown-qtee
+//@ [aarch64_unknown_qtee] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_nuttx
 //@ [aarch64_unknown_nuttx] compile-flags: --target aarch64-unknown-nuttx
 //@ [aarch64_unknown_nuttx] needs-llvm-components: aarch64
@@ -655,6 +661,9 @@
 //@ revisions: wasm32_unknown_unknown
 //@ [wasm32_unknown_unknown] compile-flags: --target wasm32-unknown-unknown
 //@ [wasm32_unknown_unknown] needs-llvm-components: webassembly
+//@ revisions: wasm32_none_component
+//@ [wasm32_none_component] compile-flags: --target wasm32-none-component
+//@ [wasm32_none_component] needs-llvm-components: webassembly
 //@ revisions: wasm32v1_none
 //@ [wasm32v1_none] compile-flags: --target wasm32v1-none
 //@ [wasm32v1_none] needs-llvm-components: webassembly
@@ -724,6 +733,9 @@
 //@ revisions: x86_64_unknown_hermit
 //@ [x86_64_unknown_hermit] compile-flags: --target x86_64-unknown-hermit
 //@ [x86_64_unknown_hermit] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_hyperlight
+//@ [x86_64_unknown_hyperlight] compile-flags: --target x86_64-unknown-hyperlight
+//@ [x86_64_unknown_hyperlight] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_illumos
 //@ [x86_64_unknown_illumos] compile-flags: --target x86_64-unknown-illumos
 //@ [x86_64_unknown_illumos] needs-llvm-components: x86
@@ -820,27 +832,25 @@
 //@ revisions: riscv64gc_unknown_nuttx_elf
 //@ [riscv64gc_unknown_nuttx_elf] compile-flags: --target riscv64gc-unknown-nuttx-elf
 //@ [riscv64gc_unknown_nuttx_elf] needs-llvm-components: riscv
-// FIXME: disabled since it requires a custom LLVM until the upstream LLVM adds support for the target (https://github.com/espressif/llvm-project/issues/4)
-/*
-    revisions: xtensa_esp32_none_elf
-    [xtensa_esp32_none_elf] compile-flags: --target xtensa-esp32-none-elf
-    [xtensa_esp32_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32_espidf
-    [xtensa_esp32_espidf] compile-flags: --target xtensa-esp32s2-espidf
-    [xtensa_esp32_espidf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s2_none_elf
-    [xtensa_esp32s2_none_elf] compile-flags: --target xtensa-esp32s2-none-elf
-    [xtensa_esp32s2_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s2_espidf
-    [xtensa_esp32s2_espidf] compile-flags: --target xtensa-esp32s2-espidf
-    [xtensa_esp32s2_espidf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s3_none_elf
-    [xtensa_esp32s3_none_elf] compile-flags: --target xtensa-esp32s3-none-elf
-    [xtensa_esp32s3_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s3_espidf
-    [xtensa_esp32s3_espidf] compile-flags: --target xtensa-esp32s3-espidf
-    [xtensa_esp32s3_espidf] needs-llvm-components: xtensa
-*/
+//@ revisions: xtensa_esp32_none_elf
+//@ [xtensa_esp32_none_elf] compile-flags: --target xtensa-esp32-none-elf
+//@ [xtensa_esp32_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32_espidf
+//@ [xtensa_esp32_espidf] compile-flags: --target xtensa-esp32s2-espidf
+//@ [xtensa_esp32_espidf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s2_none_elf
+//@ [xtensa_esp32s2_none_elf] compile-flags: --target xtensa-esp32s2-none-elf
+//@ [xtensa_esp32s2_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s2_espidf
+//@ [xtensa_esp32s2_espidf] compile-flags: --target xtensa-esp32s2-espidf
+//@ [xtensa_esp32s2_espidf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s3_none_elf
+//@ [xtensa_esp32s3_none_elf] compile-flags: --target xtensa-esp32s3-none-elf
+//@ [xtensa_esp32s3_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s3_espidf
+//@ [xtensa_esp32s3_espidf] compile-flags: --target xtensa-esp32s3-espidf
+//@ [xtensa_esp32s3_espidf] needs-llvm-components: xtensa
+
 // Sanity-check that each target can produce assembly code.
 
 #![feature(no_core, lang_items)]

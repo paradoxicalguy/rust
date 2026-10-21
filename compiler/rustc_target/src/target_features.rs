@@ -171,6 +171,7 @@ static ARM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
         },
         &[],
     ),
+    ("bf16", Unstable(sym::arm_target_feature), &["neon"]),
     ("crc", Unstable(sym::arm_target_feature), &[]),
     ("d32", Unstable(sym::arm_target_feature), &[]),
     ("dotprod", Unstable(sym::arm_target_feature), &["neon"]),
@@ -496,6 +497,8 @@ static X86_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("lahfsahf", Unstable(sym::lahfsahf_target_feature), &[]),
     ("lzcnt", Stable, &[]),
     ("movbe", Stable, &[]),
+    ("movdir64b", Unstable(sym::movdir64b_target_feature), &[]),
+    ("movdiri", Unstable(sym::movdiri_target_feature), &[]),
     ("movrs", Unstable(sym::movrs_target_feature), &[]),
     ("pclmulqdq", Stable, &["sse2"]),
     ("popcnt", Stable, &[]),
@@ -680,9 +683,9 @@ static RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("a", Stable, &["zaamo", "zalrsc"]),
     ("b", Stable, &["zba", "zbb", "zbs"]),
     ("c", Stable, &["zca"]),
-    ("d", Unstable(sym::riscv_target_feature), &["f"]),
-    ("e", Unstable(sym::riscv_target_feature), &[]),
-    ("f", Unstable(sym::riscv_target_feature), &["zicsr"]),
+    ("d", Stable, &["f"]),
+    ("e", Unstable(sym::riscv_target_feature), &[]), // negative feature! needs special care.
+    ("f", Stable, &["zicsr"]),
     (
         "forced-atomics",
         // Not implied by any CPU model or other feature.
@@ -692,7 +695,14 @@ static RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
         },
         &[],
     ),
-    ("m", Stable, &[]),
+    // According to the RISC-V spec, the M ISA extension (integer multiplication/division) is supported only when the M bit
+    // of the misa register is 1, while Zmmul means integer multiplication is always supported.
+    //
+    // The Rust/LLVM "m" target feature means something slightly different: with "m" enabled, it is assumed that integer
+    // multiplication and division will always be available (M bit will be 1 in misa), so "m" implies "zmmul".
+    //
+    // See discussion in the PR adding Zmmul: https://github.com/rust-lang/rust/pull/162552
+    ("m", Stable, &["zmmul"]),
     ("relax", Unstable(sym::riscv_target_feature), &[]),
     (
         "rva23u64",
@@ -793,6 +803,7 @@ static RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("zksed", Stable, &[]),
     ("zksh", Stable, &[]),
     ("zkt", Stable, &[]),
+    ("zmmul", Unstable(sym::riscv_target_feature), &[]),
     ("ztso", Stable, &[]),
     ("zvbb", Unstable(sym::riscv_target_feature), &["zvkb"]), // Zvbb ⊃ Zvkb
     ("zvbc", Unstable(sym::riscv_target_feature), &["zve64x"]),
@@ -849,7 +860,7 @@ static WASM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("sign-ext", Stable, &[]),
     ("simd128", Stable, &[]),
     ("tail-call", Stable, &[]),
-    ("wide-arithmetic", Unstable(sym::wasm_target_feature), &[]),
+    ("wide-arithmetic", Stable, &[]),
     // tidy-alphabetical-end
 ];
 
@@ -1054,26 +1065,28 @@ const XTENSA_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
 ///
 /// IMPORTANT: If you're adding another feature list above, make sure to add it to this iterator!
 pub fn all_rust_features() -> impl Iterator<Item = (&'static str, Stability)> {
-    std::iter::empty()
-        .chain(ARM_FEATURES)
-        .chain(AARCH64_FEATURES)
-        .chain(X86_FEATURES)
-        .chain(HEXAGON_FEATURES)
-        .chain(POWERPC_FEATURES)
-        .chain(MIPS_FEATURES)
-        .chain(NVPTX_FEATURES)
-        .chain(RISCV_FEATURES)
-        .chain(WASM_FEATURES)
-        .chain(BPF_FEATURES)
-        .chain(XTENSA_FEATURES)
-        .chain(CSKY_FEATURES)
-        .chain(LOONGARCH_FEATURES)
-        .chain(IBMZ_FEATURES)
-        .chain(SPARC_FEATURES)
-        .chain(M68K_FEATURES)
-        .chain(AVR_FEATURES)
-        .cloned()
-        .map(|(f, s, _)| (f, s))
+    [
+        ARM_FEATURES,
+        AARCH64_FEATURES,
+        X86_FEATURES,
+        HEXAGON_FEATURES,
+        POWERPC_FEATURES,
+        MIPS_FEATURES,
+        NVPTX_FEATURES,
+        RISCV_FEATURES,
+        WASM_FEATURES,
+        BPF_FEATURES,
+        XTENSA_FEATURES,
+        CSKY_FEATURES,
+        LOONGARCH_FEATURES,
+        IBMZ_FEATURES,
+        SPARC_FEATURES,
+        M68K_FEATURES,
+        AVR_FEATURES,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(f, s, _)| (*f, *s))
 }
 
 /// Find which target architectures a feature belongs to.

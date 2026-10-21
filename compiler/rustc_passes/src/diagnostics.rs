@@ -2,9 +2,7 @@ use std::io::Error;
 use std::path::{Path, PathBuf};
 
 use rustc_errors::codes::*;
-use rustc_errors::{
-    Diag, DiagCtxtHandle, DiagSymbolList, Diagnostic, EmissionGuarantee, Level, MultiSpan, msg,
-};
+use rustc_errors::{Diag, DiagCtxtHandle, DiagSymbolList, Diagnostic, Level, msg};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::middle::resolve::MainDefinition;
 use rustc_middle::ty::Ty;
@@ -28,33 +26,6 @@ pub(crate) struct MixedExportNameAndNoMangle {
     pub export_name_span: Span,
     pub no_mangle_attr: &'static str,
     pub export_name_attr: &'static str,
-}
-
-#[derive(Diagnostic)]
-#[diag("crate-level attribute should be an inner attribute")]
-pub(crate) struct OuterCrateLevelAttr {
-    #[subdiagnostic]
-    pub suggestion: OuterCrateLevelAttrSuggestion,
-}
-
-#[derive(Subdiagnostic)]
-#[multipart_suggestion("add a `!`", style = "verbose")]
-pub(crate) struct OuterCrateLevelAttrSuggestion {
-    #[suggestion_part(code = "!")]
-    pub bang_position: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("crate-level attribute should be in the root module")]
-pub(crate) struct InnerCrateLevelAttr;
-
-#[derive(Diagnostic)]
-#[diag("`#[non_exhaustive]` can't be used to annotate items with default field values")]
-pub(crate) struct NonExhaustiveWithDefaultFieldValues {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("this struct has default field values")]
-    pub defn_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -105,26 +76,6 @@ pub(crate) struct DocSearchUnboxInvalid {
 }
 
 #[derive(Diagnostic)]
-#[diag("conflicting doc inlining attributes")]
-#[help("remove one of the conflicting attributes")]
-pub(crate) struct DocInlineConflict {
-    #[primary_span]
-    pub spans: MultiSpan,
-}
-
-#[derive(Diagnostic)]
-#[diag("this attribute can only be applied to a `use` item")]
-#[note(
-    "read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#inline-and-no_inline> for more information"
-)]
-pub(crate) struct DocInlineOnlyUse {
-    #[label("only applicable on `use` items")]
-    pub attr_span: Span,
-    #[label("not a `use` item")]
-    pub item_span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("this attribute can only be applied to an `extern crate` item")]
 #[note(
     "read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information"
@@ -153,48 +104,6 @@ pub(crate) struct BothOptimizeNoneAndInline {
     pub optimize_span: Span,
     #[label("`#[inline]` here")]
     pub inline_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("attribute should be applied to an `extern` block with non-Rust ABI")]
-#[warning(
-    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
-)]
-pub(crate) struct Link;
-
-#[derive(Diagnostic)]
-#[diag("#[rustc_legacy_const_generics] functions must only have const generics")]
-pub(crate) struct RustcLegacyConstGenericsOnly {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("non-const generic parameter")]
-    pub param_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("#[rustc_legacy_const_generics] must have one index for each generic parameter")]
-pub(crate) struct RustcLegacyConstGenericsIndex {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("generic parameters")]
-    pub generics_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("index exceeds number of arguments")]
-pub(crate) struct RustcLegacyConstGenericsIndexExceed {
-    #[primary_span]
-    #[label(
-        "there {$arg_count ->
-            [one] is
-            *[other] are
-        } only {$arg_count} {$arg_count ->
-            [one] argument
-            *[other] arguments
-        }"
-    )]
-    pub span: Span,
-    pub arg_count: usize,
 }
 
 #[derive(Diagnostic)]
@@ -235,21 +144,8 @@ pub(crate) struct RustcForceInlineCoro {
     pub span: Span,
 }
 
-#[derive(Diagnostic)]
-pub(crate) enum MacroExport {
-    #[diag("`#[macro_export]` has no effect on declarative macro definitions")]
-    #[note("declarative macros follow the same exporting rules as regular items")]
-    OnDeclMacro,
-}
-
 #[derive(Subdiagnostic)]
 pub(crate) enum UnusedNote {
-    #[note("attribute `{$name}` with an empty list has no effect")]
-    EmptyList { name: Symbol },
-    #[note("attribute `{$name}` without any lints has no effect")]
-    NoLints { name: Symbol },
-    #[note("`default_method_body_is_const` has been replaced with `const` on traits")]
-    DefaultMethodBodyConst,
     #[note(
         "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked"
     )]
@@ -423,9 +319,9 @@ pub(crate) struct NoMainErr {
     pub add_teach_note: bool,
 }
 
-impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for NoMainErr {
+impl<'a> Diagnostic<'a> for NoMainErr {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a> {
         let mut diag =
             Diag::new(dcx, level, msg!("`main` function not found in crate `{$crate_name}`"));
         diag.span(DUMMY_SP);
@@ -489,9 +385,9 @@ pub(crate) struct DuplicateLangItem {
     pub(crate) duplicate: Duplicate,
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for DuplicateLangItem {
+impl Diagnostic<'_> for DuplicateLangItem {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         let mut diag = Diag::new(
             dcx,
             level,
@@ -592,13 +488,6 @@ pub(crate) struct UselessAssignment<'a> {
     pub is_field_assign: bool,
     pub ty: Ty<'a>,
 }
-
-#[derive(Diagnostic)]
-#[diag("`#[inline]` is ignored on externally exported functions")]
-#[help(
-    "externally exported functions are functions with `#[no_mangle]`, `#[export_name]`, or `#[linkage]`"
-)]
-pub(crate) struct InlineIgnoredForExported;
 
 #[derive(Diagnostic)]
 #[diag("transparent {$target} cannot have other repr hints", code = E0692)]
@@ -959,6 +848,10 @@ pub(crate) struct UnnecessaryPartialStableFeature {
 #[note("see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information")]
 pub(crate) struct IneffectiveUnstableImpl;
 
+#[derive(Diagnostic)]
+#[diag("`#[unstable]` does not make this re-exported path unstable")]
+pub(crate) struct IneffectiveUnstableReexport;
+
 // FIXME(jdonszelmann): move back to rustc_attr
 #[derive(Diagnostic)]
 #[diag(
@@ -1133,7 +1026,7 @@ pub(crate) struct GlobOrListDelegationUnusedTargetExpr {
 
 #[derive(Diagnostic)]
 #[diag("unknown parameter `{$name}`")]
-#[help(r#"expect either a generic argument name, {"`{This}`"}, {"`{Expected}`"} or {"`{Found}`"} as format argument"#)]
+#[help(r#"expect either a generic argument name, {"`{this}`"}, {"`{expected}`"} or {"`{found}`"} as format argument"#)]
 pub(crate) struct OnTypeErrorMalformedFormatLiterals {
     pub name: Symbol,
 }
@@ -1181,4 +1074,26 @@ pub(crate) struct RustcAtumSuggestion {
         applicability = "machine-applicable"
     )]
     pub unstable_mod_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`{$item_ident}` is expected to be {$expected_variance} in `{$param_ident}` but is not")]
+pub(crate) struct RustcAssertVarianceFailed {
+    #[primary_span]
+    pub item_span: Span,
+    #[subdiagnostic]
+    pub note: RustcAssertVarianceFailedNote,
+    #[label("`{$item_ident}` is {$actual_variance} in `{$param_ident}`")]
+    pub param_span: Span,
+    pub param_ident: Ident,
+    pub item_ident: Ident,
+    pub expected_variance: Symbol,
+    pub actual_variance: Symbol,
+}
+
+#[derive(Subdiagnostic)]
+#[note("required by this attribute")]
+pub(crate) struct RustcAssertVarianceFailedNote {
+    #[primary_span]
+    pub span: Span,
 }

@@ -41,7 +41,7 @@ use crate::{fmt, intrinsics, process, thread};
 #[doc(hidden)]
 #[allow(dead_code)]
 #[used(compiler)]
-pub static EMPTY_PANIC: fn(&'static str) -> ! =
+pub(crate) static EMPTY_PANIC: fn(&'static str) -> ! =
     begin_panic::<&'static str> as fn(&'static str) -> !;
 
 // Binary interface to the panic runtime that the standard library depends on.
@@ -495,7 +495,7 @@ pub unsafe fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any +
 
 /// Invoke a closure, capturing the cause of an unwinding panic if one occurs.
 #[cfg(not(panic = "immediate-abort"))]
-pub unsafe fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any + Send>> {
+pub(crate) unsafe fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any + Send>> {
     union Data<F, R> {
         f: ManuallyDrop<F>,
         r: ManuallyDrop<R>,
@@ -599,14 +599,14 @@ pub unsafe fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any +
 
 /// Determines whether the current thread is unwinding because of panic.
 #[inline]
-pub fn panicking() -> bool {
+pub(crate) fn panicking() -> bool {
     !panic_count::count_is_zero()
 }
 
 /// Entry point of panics from the core crate (`panic_impl` lang item).
 #[cfg(not(any(test, doctest)))]
 #[panic_handler]
-pub fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
+pub(crate) fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
     struct FormatStringPayload<'a> {
         inner: &'a core::panic::PanicMessage<'a>,
         string: Option<String>,
@@ -706,7 +706,7 @@ pub fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
 #[rustc_do_not_const_check] // hooked by const-eval
 pub const fn begin_panic<M: Any + Send>(msg: M) -> ! {
     if cfg!(panic = "immediate-abort") {
-        intrinsics::abort()
+        intrinsics::abort_immediate()
     }
 
     struct Payload<A> {
@@ -839,7 +839,7 @@ fn panic_with_hook(
 /// This is the entry point for `resume_unwind`.
 /// It just forwards the payload to the panic runtime.
 #[cfg_attr(panic = "immediate-abort", inline)]
-pub fn resume_unwind(payload: Box<dyn Any + Send>) -> ! {
+pub(crate) fn resume_unwind(payload: Box<dyn Any + Send>) -> ! {
     if let Some(must_abort) = panic_count::increase(false) {
         match must_abort {
             panic_count::MustAbort::PanicInHook => {
@@ -887,5 +887,5 @@ fn rust_panic(msg: &mut dyn PanicPayload) -> ! {
 #[cfg_attr(not(test), rustc_std_internal_symbol)]
 #[cfg(panic = "immediate-abort")]
 fn rust_panic(_: &mut dyn PanicPayload) -> ! {
-    crate::intrinsics::abort();
+    crate::intrinsics::abort_immediate();
 }

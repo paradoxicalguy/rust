@@ -2,8 +2,8 @@ use std::fmt::Debug;
 
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::{
-    self as ty, AliasTerm, Binder, FallibleTypeFolder, InferCtxtLike, Interner, PredicateProxy,
-    TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex, eager_resolve_vars,
+    self as ty, AliasTerm, Binder, Const, FallibleTypeFolder, InferCtxtLike, Interner,
+    PredicateProxy, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
 };
 use tracing::instrument;
 
@@ -139,15 +139,15 @@ where
 
         if self.cx().renormalize_rigid_aliases() && orig_is_rigid == ty::IsRigid::Yes {
             // find out missing typing env change.
-            let original = eager_resolve_vars(infcx, original);
-            let normalized = eager_resolve_vars(infcx, normalized);
+            let original = infcx.deeply_resolve_via_unification_table(original);
+            let normalized = infcx.deeply_resolve_via_unification_table(normalized);
             assert_eq!(original, normalized, "rigid alias is further normalized");
         }
         Ok(normalized)
     }
 
     #[instrument(level = "trace", skip(self), ret)]
-    fn try_fold_const(&mut self, ct: I::Const) -> Result<I::Const, Self::Error> {
+    fn try_fold_const(&mut self, ct: Const<I>) -> Result<Const<I>, Self::Error> {
         let infcx = self.infcx;
         let original = ct;
 
@@ -189,8 +189,8 @@ where
 
         if self.cx().renormalize_rigid_aliases() && orig_is_rigid == ty::IsRigid::Yes {
             // find out missing typing env change.
-            let original = eager_resolve_vars(infcx, original);
-            let normalized = eager_resolve_vars(infcx, normalized);
+            let original = infcx.deeply_resolve_via_unification_table(original);
+            let normalized = infcx.deeply_resolve_via_unification_table(normalized);
             assert_eq!(original, normalized, "rigid alias is further normalized");
         }
 

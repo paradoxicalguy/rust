@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rustc_errors::{Applicability, Diag, EmissionGuarantee, ErrorGuaranteed};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::HirId;
 use rustc_hir::def_id::DefId;
@@ -21,7 +21,7 @@ use rustc_macros::{
     Decodable, Encodable, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable,
 };
 use rustc_span::def_id::{CRATE_DEF_ID, LocalDefId};
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, OrdSpan, Span, Symbol, sym};
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
@@ -137,8 +137,8 @@ impl<'tcx> ObligationCause<'tcx> {
     pub fn to_constraint_category(&self) -> ConstraintCategory<'tcx> {
         match self.code() {
             ObligationCauseCode::MatchImpl(cause, _) => cause.to_constraint_category(),
-            ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span) => {
-                ConstraintCategory::Predicate(*predicate_span)
+            ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span, def_id) => {
+                ConstraintCategory::Predicate(*predicate_span, *def_id)
             }
             _ => ConstraintCategory::BoringNoLocation,
         }
@@ -238,7 +238,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// Return type must be `Sized`.
     SizedReturnType,
     /// Return type of a call expression must be `Sized`.
-    SizedCallReturnType,
+    SizedCallReturnType(HirId),
     /// Yield type must be `Sized`.
     SizedYieldType,
     /// Inline asm operand type must be `Sized`.
@@ -384,7 +384,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// This is purely for diagnostic purposes - it is always
     /// correct to use `Misc` instead, or to specify
     /// `WellFormed(None)`.
-    WellFormed(Option<WellFormedLoc>),
+    WellFormed(WellFormedLoc),
 
     /// From `match_impl`. The cause for us having to match an impl, and the DefId we are matching
     /// against.
@@ -402,7 +402,7 @@ pub enum ObligationCauseCode<'tcx> {
         output_ty: Option<Ty<'tcx>>,
     },
 
-    AscribeUserTypeProvePredicate(Span),
+    AscribeUserTypeProvePredicate(Span, DefId),
 
     RustCall,
 
@@ -461,6 +461,8 @@ pub enum WellFormedLoc {
         /// being the last 'parameter'
         param_idx: usize,
     },
+    HirId(HirId),
+    None,
 }
 
 impl<'tcx> ObligationCauseCode<'tcx> {
@@ -837,10 +839,10 @@ impl DynCompatibilityViolation {
             Self::AssocConst(name, AssocConstViolation::FeatureNotEnabled, _) => {
                 format!("it contains associated const `{name}`").into()
             }
-            Self::AssocConst(name, AssocConstViolation::NonType, _) => {
-                format!("it contains associated const `{name}` that's not defined as `type const`")
-                    .into()
-            }
+            Self::AssocConst(name, AssocConstViolation::NonType, _) => format!(
+                "it contains associated const `{name}` that's not defined as `#[rustc_always_gca]`"
+            )
+            .into(),
             Self::AssocConst(name, AssocConstViolation::Generic, _) => {
                 format!("it contains generic associated const `{name}`").into()
             }
@@ -863,15 +865,15 @@ impl DynCompatibilityViolation {
             | Self::SupertraitConst(_) => DynCompatibilityViolationSolution::None,
             Self::Method(
                 name,
-                MethodViolation::StaticMethod(Some((add_self_sugg, make_sized_sugg))),
+                MethodViolation::StaticMethod(Some(((add_s, add_sp), (make_s, make_sp)))),
                 _,
             ) => DynCompatibilityViolationSolution::AddSelfOrMakeSized {
                 name: *name,
-                add_self_sugg: add_self_sugg.clone(),
-                make_sized_sugg: make_sized_sugg.clone(),
+                add_self_sugg: (add_s.clone(), OrdSpan(*add_sp)),
+                make_sized_sugg: (make_s.clone(), OrdSpan(*make_sp)),
             },
-            Self::Method(name, MethodViolation::UndispatchableReceiver(Some(span)), _) => {
-                DynCompatibilityViolationSolution::ChangeToRefSelf(*name, *span)
+            Self::Method(name, MethodViolation::UndispatchableReceiver(Some((span, lt))), _) => {
+                DynCompatibilityViolationSolution::ChangeToRefSelf(*name, OrdSpan(*span), *lt)
             }
             Self::Method(name, ..) | Self::AssocConst(name, ..) | Self::GenericAssocTy(name, _) => {
                 DynCompatibilityViolationSolution::MoveToAnotherTrait(*name)
@@ -901,20 +903,20 @@ impl DynCompatibilityViolation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DynCompatibilityViolationSolution {
     None,
     AddSelfOrMakeSized {
         name: Symbol,
-        add_self_sugg: (String, Span),
-        make_sized_sugg: (String, Span),
+        add_self_sugg: (String, OrdSpan),
+        make_sized_sugg: (String, OrdSpan),
     },
-    ChangeToRefSelf(Symbol, Span),
+    ChangeToRefSelf(Symbol, OrdSpan, Symbol),
     MoveToAnotherTrait(Symbol),
 }
 
 impl DynCompatibilityViolationSolution {
-    pub fn add_to<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
+    pub fn add_to(self, err: &mut Diag<'_>) {
         match self {
             DynCompatibilityViolationSolution::None => {}
             DynCompatibilityViolationSolution::AddSelfOrMakeSized {
@@ -922,30 +924,30 @@ impl DynCompatibilityViolationSolution {
                 add_self_sugg,
                 make_sized_sugg,
             } => {
-                err.span_suggestion(
-                    add_self_sugg.1,
+                err.span_suggestion_verbose(
+                    add_self_sugg.1.0,
                     format!(
-                        "consider turning `{name}` into a method by giving it a `&self` \
-                             argument, so that it is accessible through the trait object's vtable"
+                        "consider turning `{name}` into a method by giving it a `&self` argument, \
+                         so that it is accessible through the trait object's vtable",
                     ),
                     add_self_sugg.0,
                     Applicability::MaybeIncorrect,
                 );
-                err.span_suggestion(
-                    make_sized_sugg.1,
+                err.span_suggestion_verbose(
+                    make_sized_sugg.1.0,
                     format!(
-                        "alternatively, consider constraining `{name}` so it is explicitly \
-                             marked as not applying to trait objects"
+                        "alternatively, consider constraining `{name}` so it is explicitly marked \
+                         as not applying to trait objects",
                     ),
                     make_sized_sugg.0,
                     Applicability::MaybeIncorrect,
                 );
             }
-            DynCompatibilityViolationSolution::ChangeToRefSelf(name, span) => {
-                err.span_suggestion(
-                    span,
+            DynCompatibilityViolationSolution::ChangeToRefSelf(name, span, lt) => {
+                err.span_suggestion_verbose(
+                    span.0,
                     format!("consider changing method `{name}`'s `self` parameter to be `&self`"),
-                    "&Self",
+                    format!("&{lt}{}self", if lt != sym::empty { " " } else { "" }),
                     Applicability::MachineApplicable,
                 );
             }
@@ -983,14 +985,17 @@ pub enum MethodViolation {
     /// e.g., `fn (mut ap: ...)`
     CVariadic,
 
-    /// the method's receiver (`self` argument) can't be dispatched on
-    UndispatchableReceiver(Option<Span>),
+    /// The method's receiver (`self` argument) can't be dispatched on
+    ///
+    /// The `Span` points at the receiver. The `Symbol` is the lifetime's name `'a` when we have
+    /// Arbitrary Self Types like `self: &'a ()`.
+    UndispatchableReceiver(Option<(Span, Symbol)>),
 }
 
 /// Reasons an associated const might not be dyn compatible.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, StableHash)]
 pub enum AssocConstViolation {
-    /// Unstable feature `min_generic_const_args` wasn't enabled.
+    /// Unstable feature `gca_min_const_items` wasn't enabled.
     FeatureNotEnabled,
 
     /// Not defined as a type-level associated const.

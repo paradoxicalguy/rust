@@ -17,7 +17,6 @@
 #![feature(iter_intersperse)]
 #![feature(option_into_flat_iter)]
 #![feature(rustc_attrs)]
-#![feature(trim_prefix_suffix)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
 
@@ -43,20 +42,20 @@ use rustc_ast::{
     self as ast, AngleBracketedArg, CRATE_NODE_ID, Crate, DUMMY_NODE_ID, Expr, ExprKind,
     GenericArg, GenericArgs, Generics, NodeId, Path, attr,
 };
+use rustc_attr_ir::{StrippedCfgItem, find_attr};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::steal::Steal;
-use rustc_data_structures::sync::{FreezeReadGuard, FreezeWriteGuard, WorkerLocal};
+use rustc_data_structures::sync::{FreezeReadGuard, FreezeWriteGuard, Lock, RwLock, WorkerLocal};
 use rustc_data_structures::unord::{UnordItems, UnordMap, UnordSet};
 use rustc_errors::{Applicability, Diag, ErrCode, ErrorGuaranteed, LintBuffer};
 use rustc_expand::base::{DeriveResolution, SyntaxExtension, SyntaxExtensionKind};
 use rustc_feature::{BUILTIN_ATTRIBUTES, Features};
-use rustc_hir::attrs::StrippedCfgItem;
 use rustc_hir::def::Namespace::{self, *};
 use rustc_hir::def::{self, CtorOf, DefKind, MacroKinds, NonMacroAttrKind, PerNS};
 use rustc_hir::def_id::{CRATE_DEF_ID, CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalDefIdMap};
 use rustc_hir::definitions::{PerParentDisambiguatorState, PerParentDisambiguatorsMap};
-use rustc_hir::{PrimTy, TraitCandidate, find_attr};
+use rustc_hir::{PrimTy, TraitCandidate};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_lint_defs::builtin::PRIVATE_MACRO_USE;
 use rustc_metadata::creader::CStore;
@@ -67,10 +66,9 @@ use rustc_middle::middle::resolve::{
 };
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, RegisteredTools, TyCtxt, TyCtxtFeed, Visibility};
-use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::{LocalModId, ModId};
 use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind, SyntaxContext, Transparency};
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, OrdSpan, Span, Symbol, bug, kw, span_bug, sym};
 use rustc_structures::CrateType;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
@@ -264,7 +262,10 @@ enum ResolutionError<'ra> {
     /// Error E0416: identifier is bound more than once in the same pattern.
     IdentifierBoundMoreThanOnceInSamePattern(Ident),
     /// Error E0426: use of undeclared label.
-    UndeclaredLabel { name: Symbol, suggestion: Option<LabelSuggestion> },
+    UndeclaredLabel {
+        name: Symbol,
+        suggestion: Option<LabelSuggestion>,
+    },
     /// Error E0433: failed to resolve.
     FailedToResolve {
         segment: Symbol,
@@ -275,7 +276,9 @@ enum ResolutionError<'ra> {
         message: String,
     },
     /// Error E0434: can't capture dynamic environment in a fn item.
-    CannotCaptureDynamicEnvironmentInFnItem,
+    CannotCaptureDynamicEnvironmentInFnItem {
+        suggest_closure: bool,
+    },
     /// Error E0435: attempt to use a non-constant value in a constant.
     AttemptToUseNonConstantValueInConstant {
         ident: Ident,
@@ -298,25 +301,34 @@ enum ResolutionError<'ra> {
     // FIXME(generic_const_parameter_types): This should give custom output specifying it's only
     // problematic to use *forward declared* parameters when the feature is enabled.
     /// ERROR E0770: the type of const parameters must not depend on other generic parameters.
-    ParamInTyOfConstParam { name: Symbol },
+    ParamInTyOfConstParam {
+        name: Symbol,
+    },
     /// cannot use self in const param
     SelfInConstParam,
     /// generic parameters must not be used inside const evaluations.
     ///
     /// This error is only emitted when using `min_const_generics`.
     ParamInNonTrivialAnonConst {
-        is_gca: bool,
+        is_gca_const_items: bool,
         name: Symbol,
         param_kind: ParamKindInNonTrivialAnonConst,
     },
     /// generic parameters must not be used inside enum discriminants.
     ///
     /// This error is emitted even with `generic_const_exprs`.
-    ParamInEnumDiscriminant { name: Symbol, param_kind: ParamKindInEnumDiscriminant },
+    ParamInEnumDiscriminant {
+        name: Symbol,
+        param_kind: ParamKindInEnumDiscriminant,
+    },
     /// Error E0735: generic parameters with a default cannot use `Self`
     ForwardDeclaredSelf(ForwardGenericParamBanReason),
     /// Error E0767: use of unreachable label
-    UnreachableLabel { name: Symbol, definition_span: Span, suggestion: Option<LabelSuggestion> },
+    UnreachableLabel {
+        name: Symbol,
+        definition_span: Span,
+        suggestion: Option<LabelSuggestion>,
+    },
     /// Error E0323, E0324, E0325: mismatch between trait item and impl item.
     TraitImplMismatch {
         name: Ident,
@@ -324,15 +336,28 @@ enum ResolutionError<'ra> {
         trait_path: String,
         trait_item_span: Span,
         code: ErrCode,
+        trait_span: Span,
+        impl_span: Span,
     },
     /// Error E0201: multiple impl items for the same trait item.
-    TraitImplDuplicate { name: Ident, trait_item_span: Span, old_span: Span },
+    TraitImplDuplicate {
+        name: Ident,
+        trait_item_span: Span,
+        old_span: Span,
+        trait_span: Span,
+        impl_span: Span,
+    },
     /// Inline asm `sym` operand must refer to a `fn` or `static`.
     InvalidAsmSym,
     /// `self` used instead of `Self` in a generic parameter
     LowercaseSelf,
     /// A never pattern has a binding.
     BindingInNeverPattern,
+    CannotUseInnerLocalInMoveExpr {
+        move_expr_span: Span,
+        ident: Ident,
+        scope_span: Span,
+    },
 }
 
 #[derive(Debug)]
@@ -1040,7 +1065,9 @@ type Decl<'ra> = Interned<'ra, DeclData<'ra>>;
 enum DeclKind<'ra> {
     /// The name declaration is a definition (possibly without a `DefId`),
     /// can be provided by source code or built into the language.
-    Def(Res),
+    ///
+    /// The reexports are only added for declarations in external modules.
+    Def(Res, &'ra [Reexport]),
     /// The name declaration is a link to another name declaration.
     Import { source_decl: Decl<'ra>, import: Import<'ra> },
 }
@@ -1152,7 +1179,7 @@ impl<'ra> DeclData<'ra> {
 
     fn res(&self) -> Res {
         match self.kind {
-            DeclKind::Def(res) => res,
+            DeclKind::Def(res, ..) => res,
             DeclKind::Import { source_decl, .. } => source_decl.res(),
         }
     }
@@ -1185,9 +1212,10 @@ impl<'ra> DeclData<'ra> {
     fn is_possibly_imported_variant(&self) -> bool {
         match self.kind {
             DeclKind::Import { source_decl, .. } => source_decl.is_possibly_imported_variant(),
-            DeclKind::Def(Res::Def(DefKind::Variant | DefKind::Ctor(CtorOf::Variant, ..), _)) => {
-                true
-            }
+            DeclKind::Def(
+                Res::Def(DefKind::Variant | DefKind::Ctor(CtorOf::Variant, ..), _),
+                _,
+            ) => true,
             DeclKind::Def(..) => false,
         }
     }
@@ -1197,7 +1225,7 @@ impl<'ra> DeclData<'ra> {
             DeclKind::Import { import, .. } => {
                 matches!(import.kind, ImportKind::ExternCrate { .. })
             }
-            DeclKind::Def(Res::Def(_, def_id)) => def_id.is_crate_root(),
+            DeclKind::Def(Res::Def(_, def_id), _) => def_id.is_crate_root(),
             _ => false,
         }
     }
@@ -1221,10 +1249,7 @@ impl<'ra> DeclData<'ra> {
     }
 
     fn is_assoc_item(&self) -> bool {
-        matches!(
-            self.res(),
-            Res::Def(DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy, _)
-        )
+        matches!(self.res(), Res::Def(DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy, _))
     }
 
     fn macro_kinds(&self) -> Option<MacroKinds> {
@@ -1232,13 +1257,21 @@ impl<'ra> DeclData<'ra> {
     }
 
     fn reexport_chain(self: Decl<'ra>) -> SmallVec<[Reexport; 2]> {
-        let mut reexport_chain = SmallVec::new();
+        let mut full_reexport_chain: SmallVec<[Reexport; 2]> = SmallVec::new();
         let mut next_binding = self;
-        while let DeclKind::Import { source_decl, import, .. } = next_binding.kind {
-            reexport_chain.push(import.simplify());
-            next_binding = source_decl;
+        loop {
+            match next_binding.kind {
+                DeclKind::Import { source_decl, import, .. } => {
+                    full_reexport_chain.push(import.simplify());
+                    next_binding = source_decl;
+                }
+                DeclKind::Def(_, reexport_chain) => {
+                    full_reexport_chain.extend(reexport_chain.iter().copied());
+                    break;
+                }
+            }
         }
-        reexport_chain
+        full_reexport_chain
     }
 
     // Suppose that we resolved macro invocation with `invoc_parent_expansion` to binding `binding`
@@ -1284,7 +1317,7 @@ struct ExternPreludeEntry<'ra> {
     item_decl: Option<(Decl<'ra>, Span, /* introduced by item */ bool)>,
     /// Name declaration from an `--extern` flag, lazily populated on first use.
     flag_decl: Option<
-        CacheCell<(
+        Lock<(
             PendingDecl<'ra>,
             /* finalized */ bool,
             /* open flag (namespaced crate) */ bool,
@@ -1300,14 +1333,14 @@ impl ExternPreludeEntry<'_> {
     fn flag() -> Self {
         ExternPreludeEntry {
             item_decl: None,
-            flag_decl: Some(CacheCell::new((PendingDecl::Pending, false, false))),
+            flag_decl: Some(Lock::new((PendingDecl::Pending, false, false))),
         }
     }
 
     fn open_flag() -> Self {
         ExternPreludeEntry {
             item_decl: None,
-            flag_decl: Some(CacheCell::new((PendingDecl::Pending, false, true))),
+            flag_decl: Some(Lock::new((PendingDecl::Pending, false, true))),
         }
     }
 
@@ -1407,14 +1440,14 @@ pub struct Resolver<'ra, 'tcx> {
     /// Eagerly populated map of all local non-block modules.
     local_module_map: FxIndexMap<LocalDefId, LocalModule<'ra>>,
     /// Lazily populated cache of modules loaded from external crates.
-    extern_module_map: CacheRefCell<FxIndexMap<DefId, ExternModule<'ra>>>,
+    extern_module_map: RwLock<FxIndexMap<DefId, ExternModule<'ra>>>,
 
     /// Maps glob imports to the names of items actually imported.
-    glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>>,
+    glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>> = default::fx_index_map(),
     glob_error: Option<ErrorGuaranteed> = None,
     visibilities_for_hashing: Vec<(LocalDefId, Visibility)> = Vec::new(),
     used_imports: FxHashSet<NodeId> = default::fx_hash_set(),
-    maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
+    maybe_unused_trait_imports: FxIndexSet<LocalDefId> = default::fx_index_set(),
 
     /// Privacy errors are delayed until the end in order to deduplicate them.
     privacy_errors: Vec<PrivacyError<'ra>> = Vec::new(),
@@ -1424,30 +1457,31 @@ pub struct Resolver<'ra, 'tcx> {
     /// Visibility path resolution failures are delayed until all modules are collected.
     delayed_vis_resolution_errors: Vec<DelayedVisResolutionError<'ra>> = Vec::new(),
     /// Crate-local macro expanded `macro_export` referred to by a module-relative path.
-    macro_expanded_macro_export_errors: BTreeSet<(Span, Span)> = BTreeSet::new(),
+    macro_expanded_macro_export_errors: BTreeSet<(OrdSpan, OrdSpan)> = BTreeSet::new(),
 
     arenas: &'ra WorkerLocal<ResolverArenas<'ra>>,
     dummy_decl: Decl<'ra>,
     builtin_type_decls: FxHashMap<Symbol, Decl<'ra>>,
     builtin_attr_decls: FxHashMap<Symbol, Decl<'ra>>,
     registered_attr_tool_decls: FxHashMap<IdentKey, Decl<'ra>>,
-    macro_names: FxHashSet<IdentKey> = default::fx_hash_set(),
+    macro_names: FxHashMap<IdentKey, LocalDefId> = default::fx_hash_map(),
     builtin_macros: FxHashMap<Symbol, SyntaxExtensionKind> = default::fx_hash_map(),
     registered_attr_tools: &'tcx RegisteredTools,
     registered_lint_tools: &'tcx RegisteredTools,
-    macro_use_prelude: FxIndexMap<Symbol, Decl<'ra>>,
+    macro_use_prelude: FxIndexMap<Symbol, Decl<'ra>> = default::fx_index_map(),
     /// Eagerly populated map of all local macro definitions.
     local_macro_map: FxHashMap<LocalDefId, &'ra Arc<SyntaxExtension>> = default::fx_hash_map(),
     /// Lazily populated cache of macro definitions loaded from external crates.
-    extern_macro_map: CacheRefCell<FxHashMap<DefId, &'ra Arc<SyntaxExtension>>>,
+    extern_macro_map: RwLock<FxHashMap<DefId, &'ra Arc<SyntaxExtension>>>,
     dummy_ext_bang: &'ra Arc<SyntaxExtension>,
     dummy_ext_derive: &'ra Arc<SyntaxExtension>,
     non_macro_attr: &'ra Arc<SyntaxExtension>,
     local_macro_def_scopes: FxHashMap<LocalDefId, LocalModule<'ra>> = default::fx_hash_map(),
     ast_transform_scopes: FxHashMap<LocalExpnId, LocalModule<'ra>> = default::fx_hash_map(),
-    unused_macros: FxIndexMap<LocalDefId, (NodeId, Ident)>,
+    unused_macros: FxIndexMap<LocalDefId, (NodeId, Ident, Option<DefId>)> = default::fx_index_map(),
+    macro_use_mods: FxIndexSet<NodeId> = default::fx_index_set(),
     /// A map from the macro to all its potentially unused arms and the `LocalDefId` of the macro itself.
-    unused_macro_rules: FxIndexMap<NodeId, (LocalDefId, DenseBitSet<usize>)>,
+    unused_macro_rules: FxIndexMap<NodeId, (LocalDefId, DenseBitSet<usize>)> = default::fx_index_map(),
     proc_macro_stubs: FxHashSet<LocalDefId> = default::fx_hash_set(),
     /// Traces collected during macro resolution and validated when it's complete.
     single_segment_macro_resolutions:
@@ -1514,24 +1548,25 @@ pub struct Resolver<'ra, 'tcx> {
     /// Generic args to suggest for required params (e.g. `<'_>`, `<_, _>`), if any.
     item_required_generic_args_suggestions: FxHashMap<LocalDefId, String> = default::fx_hash_map(),
     delegation_fn_sigs: LocalDefIdMap<DelegationFnSig> = Default::default(),
-    delegation_infos: FxIndexMap<LocalDefId, DelegationInfo>,
-    delegation_inherent_fn_map: FxIndexMap<LocalDefId, FxIndexMap<Ident, DelegationInherentFnKind>>,
+    delegation_infos: FxIndexMap<LocalDefId, DelegationInfo> = default::fx_index_map(),
+    delegation_inherent_fn_map: FxIndexMap<LocalDefId, FxIndexMap<Ident, DelegationInherentFnKind>> = default::fx_index_map(),
 
     main_def: Option<MainDefinition> = None,
-    trait_impls: FxIndexMap<DefId, Vec<LocalDefId>>,
+    trait_impls: FxIndexMap<DefId, Vec<LocalDefId>> = default::fx_index_map(),
     /// A list of proc macro LocalDefIds, written out in the order in which
     /// they are declared in the static array generated by proc_macro_harness.
     proc_macros: Vec<LocalDefId> = Vec::new(),
-    confused_type_with_std_module: FxIndexMap<Span, Span>,
+    paths_matching_assoc_types: UnordSet<Span> = Default::default(),
+    confused_type_with_std_module: FxIndexMap<Span, Span> = default::fx_index_map(),
 
     /// Names of items that were stripped out via cfg with their corresponding cfg meta item.
     stripped_cfg_items: Vec<StrippedCfgItem<NodeId>> = Vec::new(),
 
-    effective_visibilities: EffectiveVisibilities,
-    macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
+    effective_visibilities: EffectiveVisibilities = Default::default(),
+    macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>> = default::fx_index_map(),
 
-    doc_link_resolutions: FxIndexMap<LocalModId, DocLinkResMap>,
-    doc_link_traits_in_scope: FxIndexMap<LocalModId, Vec<DefId>>,
+    doc_link_resolutions: FxIndexMap<LocalModId, DocLinkResMap> = default::fx_index_map(),
+    doc_link_traits_in_scope: FxIndexMap<LocalModId, Vec<DefId>> = default::fx_index_map(),
     all_macro_rules: UnordSet<Symbol> = Default::default(),
 
     /// Invocation ids of all glob delegations.
@@ -1557,6 +1592,11 @@ pub struct Resolver<'ra, 'tcx> {
     // that were encountered during resolution. These names are used to generate item names
     // for APITs, so we don't want to leak details of resolution into these names.
     impl_trait_names: FxHashMap<NodeId, Symbol> = default::fx_hash_map(),
+
+    /// When enabled, after reporting every error we will `FatalError.raise()` to avoid advancing
+    /// to the next compiler stage. Only used when encountering resolution errors that cause lots of
+    /// unnecessary knock down errors.
+    raise_fatal_after_resolve: bool = false,
 
     /// Stores `#[diagnostic::on_unknown]` attributes placed on module declarations.
     on_unknown_data: FxHashMap<LocalDefId, OnUnknownData> = default::fx_hash_map(),
@@ -1585,7 +1625,7 @@ impl<'ra> ResolverArenas<'ra> {
         parent_module: Option<Module<'ra>>,
     ) -> Decl<'ra> {
         self.alloc_decl(DeclData {
-            kind: DeclKind::Def(res),
+            kind: DeclKind::Def(res, &[]),
             ambiguity: CmCell::new(None),
             initial_vis: vis,
             ambiguity_vis_max: CmCell::new(None),
@@ -1613,7 +1653,7 @@ impl<'ra> ResolverArenas<'ra> {
         Interned::new_unchecked(self.name_resolutions.alloc(CmRefCell::new(resolution)))
     }
     fn alloc_macro_rules_scope(&'ra self, scope: MacroRulesScope<'ra>) -> MacroRulesScopeRef<'ra> {
-        self.dropless.alloc(CacheCell::new(scope))
+        self.dropless.alloc(RwLock::new(scope))
     }
     fn alloc_macro_rules_decl(&'ra self, decl: MacroRulesDecl<'ra>) -> &'ra MacroRulesDecl<'ra> {
         self.dropless.alloc(decl)
@@ -1663,7 +1703,12 @@ impl<'tcx> Resolver<'_, 'tcx> {
 
     /// Get the `DefId` of a child of the current owner
     fn local_def_id(&self, node: NodeId) -> LocalDefId {
-        self.opt_local_def_id(node).unwrap_or_else(|| panic!("no entry for node id: `{node:?}`"))
+        self.opt_local_def_id(node).unwrap_or_else(|| {
+            panic!(
+                "no entry for node id `{node:?}` in owner {:?}, available: {:#?}",
+                self.current_owner.def_id, self.current_owner.node_id_to_def_id
+            )
+        })
     }
 
     /// Adds a definition with a parent definition.
@@ -1735,7 +1780,7 @@ impl<'tcx> Resolver<'_, 'tcx> {
                 .filter_map(|param| match param.kind {
                     ty::GenericParamDefKind::Lifetime => Some("'_"),
                     ty::GenericParamDefKind::Type { has_default, .. }
-                    | ty::GenericParamDefKind::Const { has_default } => {
+                    | ty::GenericParamDefKind::Const { has_default, arg_pos: _ } => {
                         if has_default {
                             None
                         } else {
@@ -1834,9 +1879,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             local_module_map,
             extern_module_map: Default::default(),
 
-            glob_map: Default::default(),
-            maybe_unused_trait_imports: Default::default(),
-
             arenas,
             dummy_decl: arenas.new_pub_def_decl(Res::Err, DUMMY_SP, LocalExpnId::ROOT),
             builtin_type_decls: PrimTy::ALL
@@ -1865,30 +1907,18 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 .collect(),
             registered_attr_tools,
             registered_lint_tools,
-            macro_use_prelude: Default::default(),
             extern_macro_map: Default::default(),
             dummy_ext_bang: arenas.alloc_macro(SyntaxExtension::dummy_bang(edition)),
             dummy_ext_derive: arenas.alloc_macro(SyntaxExtension::dummy_derive(edition)),
             non_macro_attr: arenas.alloc_macro(SyntaxExtension::non_macro_attr(edition)),
-            unused_macros: Default::default(),
-            unused_macro_rules: Default::default(),
             single_segment_macro_resolutions: Default::default(),
             multi_segment_macro_resolutions: Default::default(),
             lint_buffer: LintBuffer::default(),
             owners,
             current_owner: PerOwnerResolverData::new(DUMMY_NODE_ID, CRATE_DEF_ID),
             invocation_parents,
-            trait_impls: Default::default(),
-            confused_type_with_std_module: Default::default(),
-            stripped_cfg_items: Default::default(),
-            effective_visibilities: Default::default(),
-            macro_reachable_adts: Default::default(),
-            doc_link_resolutions: Default::default(),
-            doc_link_traits_in_scope: Default::default(),
             current_crate_outer_attr_insert_span,
             disambiguators: Default::default(),
-            delegation_infos: Default::default(),
-            delegation_inherent_fn_map: Default::default(),
             features: tcx.features(),
             ..
         };
@@ -1958,6 +1988,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let glob_map = self.glob_map;
         let main_def = self.main_def;
         let confused_type_with_std_module = self.confused_type_with_std_module;
+        let paths_matching_assoc_types = self.paths_matching_assoc_types;
         let effective_visibilities = self.effective_visibilities;
 
         let stripped_cfg_items = self
@@ -1988,6 +2019,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             trait_impls: self.trait_impls,
             proc_macros,
             confused_type_with_std_module,
+            paths_matching_assoc_types,
             doc_link_resolutions: self.doc_link_resolutions,
             doc_link_traits_in_scope: self.doc_link_traits_in_scope,
             all_macro_rules: self.all_macro_rules,
@@ -2091,6 +2123,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
         // Don't mutate the cstore or stable crate id map from here on.
         self.tcx.untracked().freeze_cstore();
+        if self.raise_fatal_after_resolve {
+            rustc_errors::FatalError.raise();
+        }
     }
 
     fn traits_in_scope(
@@ -2424,7 +2459,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         self.pat_span_map.insert(node, span);
     }
 
-    fn is_accessible_from(&self, vis: Visibility<impl Into<DefId>>, module: Module<'ra>) -> bool {
+    fn is_accessible_from(&self, vis: Visibility<impl Into<ModId>>, module: Module<'ra>) -> bool {
         vis.is_accessible_from(module.nearest_parent_mod(), self.tcx)
     }
 
@@ -2469,7 +2504,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     ) -> Option<Decl<'ra>> {
         let entry = self.extern_prelude.get(&ident);
         entry.and_then(|entry| entry.flag_decl.as_ref()).and_then(|flag_decl| {
-            let (pending_decl, finalized, is_open) = flag_decl.get();
+            let mut flag_decl = flag_decl.lock(); // Lock for this entire process
+            let (pending_decl, finalized, is_open) = *flag_decl;
             let decl = match pending_decl {
                 PendingDecl::Ready(decl) => {
                     if finalize && !finalized && !is_open {
@@ -2504,7 +2540,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     }
                 }
             };
-            flag_decl.set((PendingDecl::Ready(decl), finalize || finalized, is_open));
+            *flag_decl = (PendingDecl::Ready(decl), finalize || finalized, is_open);
             decl.or_else(|| finalize.then_some(self.dummy_decl))
         })
     }
@@ -2843,11 +2879,6 @@ pub fn provide(providers: &mut Providers) {
 ///
 /// Prefer constructing it through `Resolver::cm(_mut)` to ensure correctness.
 type CmResolver<'r, 'ra, 'tcx> = ref_mut::RefOrMut<'r, Resolver<'ra, 'tcx>>;
-
-// FIXME: These are cells for caches that can be populated even during speculative resolution,
-// and should be replaced with mutexes, atomics, or other synchronized data when migrating to
-// parallel name resolution.
-use std::cell::{Cell as CacheCell, RefCell as CacheRefCell};
 
 mod ref_mut {
     use std::cell::{BorrowMutError, Cell, Ref, RefCell, RefMut};

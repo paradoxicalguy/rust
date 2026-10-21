@@ -9,7 +9,6 @@
 #![feature(file_buffered)]
 #![feature(panic_backtrace_config)]
 #![feature(panic_update_hook)]
-#![feature(trim_prefix_suffix)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
 
@@ -170,7 +169,7 @@ impl Callbacks for TimePassesCallbacks {
 }
 
 /// This is the primary entry point for rustc.
-pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
+pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
     let mut default_early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Throw away the first argument, the name of the binary.
@@ -185,15 +184,26 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
 
     let args = args::arg_expand_all(&default_early_dcx, at_args);
 
+    // For the purposes of checking that an --edition was passed, we only emit a message if the only
+    // argument passed to rustc is a file name.
+    let warn_unspecified_edition = match &args[..] {
+        [] => false,
+        // We explicitly don't emit the note if we're consuming code from stdin, or passing non-file
+        // flags. This can happen on some cargo invocations too.
+        [name] if name.starts_with("-") => false,
+        [_] => true,
+        _ => false,
+    };
     let (matches, help_only) = match handle_options(&default_early_dcx, &args) {
         HandledOptions::None => return,
         HandledOptions::Normal(matches) => (matches, false),
         HandledOptions::HelpOnly(matches) => (matches, true),
     };
 
-    let sopts = config::build_session_options(&mut default_early_dcx, &matches);
-    // fully initialize ice path static once unstable options are available as context
+    let sopts =
+        config::build_session_options(&mut default_early_dcx, &matches, warn_unspecified_edition);
     let ice_file = ice_path_with_config(Some(&sopts.unstable_opts)).clone();
+    let _ = ICE_COLOR.set(sopts.color);
 
     if let Some(ref code) = matches.opt_str("explain") {
         handle_explain(&default_early_dcx, code, sopts.color);
@@ -315,10 +325,6 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
 
             tcx.ensure_ok().analysis(());
 
-            if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
-                dump_feature_usage_metrics(tcx, metrics_dir);
-            }
-
             if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
                 return None;
             }
@@ -330,6 +336,10 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
             }
 
             let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+
+            if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
+                dump_feature_usage_metrics(tcx, metrics_dir);
+            }
 
             tcx.report_unused_features();
 
@@ -382,7 +392,7 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     .early_fatal("couldn't read from stdin, as it did not contain valid UTF-8");
             }
 
-            let name = match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
+            match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
                 Ok(path) => {
                     let line = env::var("UNSTABLE_RUSTDOC_TEST_LINE").expect(
                         "when UNSTABLE_RUSTDOC_TEST_PATH is set \
@@ -391,12 +401,13 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     let line = line
                         .parse::<isize>()
                         .expect("UNSTABLE_RUSTDOC_TEST_LINE needs to be a number");
-                    FileName::doc_test_source_code(PathBuf::from(path), line)
+                    Some(Input::DocTestStr { file: PathBuf::from(path), line, input })
                 }
-                Err(_) => FileName::anon_source_code(&input),
-            };
-
-            Some(Input::Str { name, input })
+                Err(_) => {
+                    let name = FileName::anon_source_code(&input);
+                    Some(Input::Str { name, input })
+                }
+            }
         }
         [ifile] => Some(Input::File(PathBuf::from(ifile))),
         [ifile1, ifile2, ..] => early_dcx.early_fatal(format!(
@@ -610,7 +621,7 @@ fn list_metadata(sess: &Session, metadata_loader: &dyn MetadataLoader) {
             }
             safe_println!("{}", String::from_utf8(v).unwrap());
         }
-        Input::Str { .. } => {
+        Input::Str { .. } | Input::DocTestStr { .. } => {
             sess.dcx().fatal("cannot list metadata for stdin");
         }
     }
@@ -1294,7 +1305,7 @@ pub fn handle_help(matches: &getopts::Matches, args: &[String]) -> bool {
     let chelp_pos = opt_help_pos("C");
     let print_help = || {
         // Only show unstable options in --help if we accept unstable options.
-        let unstable_enabled = nightly_options::is_unstable_enabled(&matches);
+        let unstable_enabled = nightly_options::unstable_options_enabled(&matches);
         let nightly_build = nightly_options::match_is_nightly_build(&matches);
         usage(matches.opt_present("verbose"), unstable_enabled, nightly_build);
     };
@@ -1344,15 +1355,17 @@ fn warn_on_confusing_output_filename_flag(
             || config::CG_OPTIONS.iter().any(|option| eq_ignore_separators(option.name(), filename))
             || fake_args.iter().any(|arg| eq_ignore_separators(arg, filename))
         {
-            early_dcx.early_warn(
-                "option `-o` has no space between flag name and value, which can be confusing",
-            );
-            early_dcx.early_note(format!(
-                "output filename `-o {name}` is applied instead of a flag named `o{name}`"
-            ));
-            early_dcx.early_help(format!(
-                "insert a space between `-o` and `{name}` if this is intentional: `-o {name}`"
-            ));
+            early_dcx
+                .early_struct_warn(
+                    "option `-o` has no space between flag name and value, which can be confusing",
+                )
+                .with_note(format!(
+                    "output filename `-o {name}` is applied instead of a flag named `o{name}`"
+                ))
+                .with_help(format!(
+                    "insert a space between `-o` and `{name}` if this is intentional: `-o {name}`"
+                ))
+                .emit();
         }
     }
 }
@@ -1362,12 +1375,14 @@ fn parse_crate_attrs<'a>(sess: &'a Session) -> PResult<'a, ast::AttrVec> {
         Input::File(file) => {
             new_parser_from_file(&sess.psess, file, StripTokens::ShebangAndFrontmatter, None)
         }
-        Input::Str { name, input } => new_parser_from_source_str(
-            &sess.psess,
-            name.clone(),
-            input.clone(),
-            StripTokens::ShebangAndFrontmatter,
-        ),
+        instr @ (Input::Str { input, .. } | Input::DocTestStr { input, .. }) => {
+            new_parser_from_source_str(
+                &sess.psess,
+                instr.file_name(sess),
+                input.clone(),
+                StripTokens::ShebangAndFrontmatter,
+            )
+        }
     });
     parser.parse_inner_attributes()
 }
@@ -1381,11 +1396,12 @@ pub fn catch_with_exit_code<T: Termination>(f: impl FnOnce() -> T) -> ExitCode {
     }
 }
 
+static ICE_COLOR: OnceLock<ColorConfig> = OnceLock::new();
 static ICE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 // This function should only be called from the ICE hook.
 //
-// The intended behavior is that `run_compiler` will invoke `ice_path_with_config` early in the
+// The intended behavior is that `compiler_entrypoint` will invoke `ice_path_with_config` early in the
 // initialization process to properly initialize the ICE_PATH static based on parsed CLI flags.
 //
 // Subsequent calls to either function will then return the proper ICE path as configured by
@@ -1527,9 +1543,10 @@ fn report_ice(
     extra_info: fn(DiagCtxtHandle<'_>),
     using_internal_features: &AtomicBool,
 ) {
+    let color = ICE_COLOR.get().copied().unwrap_or(ColorConfig::Auto);
     let emitter =
         Box::new(rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter::new(
-            stderr_destination(rustc_errors::ColorConfig::Auto),
+            stderr_destination(color),
         ));
     let dcx = DiagCtxt::new(emitter);
     let dcx = dcx.handle();
@@ -1598,7 +1615,7 @@ fn report_ice(
 
     let limit_frames = if backtrace { None } else { Some(2) };
 
-    interface::try_print_query_stack(dcx, limit_frames, file);
+    interface::try_print_query_stack(limit_frames, file);
 
     // We don't trust this callback not to panic itself, so run it at the end after we're sure we've
     // printed all the relevant info.
@@ -1673,7 +1690,7 @@ pub fn main() -> ExitCode {
     install_ctrlc_handler();
 
     let exit_code =
-        catch_with_exit_code(|| run_compiler(&args::raw_args(&early_dcx), &mut callbacks));
+        catch_with_exit_code(|| compiler_entrypoint(&args::raw_args(&early_dcx), &mut callbacks));
 
     if let Some(format) = callbacks.time_passes {
         let end_rss = get_resident_set_size();

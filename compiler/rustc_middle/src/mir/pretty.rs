@@ -6,6 +6,7 @@ use std::{fs, io};
 use rustc_abi::Size;
 use rustc_ast::InlineAsmTemplatePiece;
 use rustc_hir::Constness;
+use rustc_span::bug;
 use tracing::trace;
 use ty::print::PrettyPrinter;
 
@@ -24,7 +25,7 @@ pub(crate) const ALIGN: usize = 40;
 
 /// An indication of where we are in the control flow graph. Used for printing
 /// extra information in `dump_mir`
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PassWhere {
     /// We have not started dumping the control flow graph, but we are about to.
     BeforeCFG,
@@ -330,7 +331,13 @@ pub fn write_mir_pretty<'tcx>(tcx: TyCtxt<'tcx>, w: &mut dyn io::Write) -> io::R
         }
 
         let render_body = |w: &mut dyn io::Write, body| -> io::Result<()> {
-            writer.write_mir_fn(body, w)?;
+            if let Some(mut extra_data) = tcx.mir_pretty_extra_data(body) {
+                let mut writer = MirWriter::new(tcx);
+                writer.extra_data = &mut *extra_data;
+                writer.write_mir_fn(body, w)?;
+            } else {
+                writer.write_mir_fn(body, w)?;
+            }
 
             for body in tcx.promoted_mir(def_id) {
                 writeln!(w)?;
@@ -692,7 +699,7 @@ fn write_mir_sig(tcx: TyCtxt<'_>, body: &Body<'_>, w: &mut dyn io::Write) -> io:
     };
     match (kind, body.source.promoted) {
         (_, Some(_)) => write!(w, "const ")?, // promoteds are the closest to consts
-        (DefKind::Const { .. } | DefKind::AssocConst { .. }, _) => write!(w, "const ")?,
+        (DefKind::Const | DefKind::AssocConst, _) => write!(w, "const ")?,
         (DefKind::Static { safety: _, mutability: hir::Mutability::Not, nested: false }, _) => {
             write!(w, "static ")?
         }
@@ -785,7 +792,7 @@ impl<'a, 'tcx> MirWriter<'a, 'tcx> {
         writeln!(w, "{INDENT}{block:?}{cleanup_text}: {{")?;
 
         // List of statements in the middle.
-        let mut current_location = Location { block, statement_index: 0 };
+        let mut current_location = block.start_location();
         for statement in &data.statements {
             (self.extra_data)(PassWhere::BeforeLocation(current_location), w)?;
 

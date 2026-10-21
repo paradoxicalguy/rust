@@ -46,7 +46,7 @@ use rustc_log::tracing::debug;
 use rustc_middle::query::LocalCrate;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{ErrorOutputType, OptLevel};
-use rustc_session::{EarlyDiagCtxt, Session};
+use rustc_session::{EarlyDiagCtxt, EarlySession, Session};
 use rustc_structures::CrateType;
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
@@ -109,18 +109,18 @@ fn run_many_seeds(
 /// Generates the codegen backend for code that Miri will interpret: we basically
 /// use the dummy backend, except that we put the LLVM backend in charge of
 /// target features.
-fn make_miri_codegen_backend(sess: &Session, dep: bool) -> Box<dyn CodegenBackend> {
+fn make_miri_codegen_backend(sess: &EarlySession, dep: bool) -> Box<dyn CodegenBackend> {
     let early_dcx = EarlyDiagCtxt::new(sess.opts.error_format);
 
     // Use the target_config method of the default codegen backend (eg LLVM) to ensure the
     // calculated target features match said backend by respecting eg -Ctarget-cpu.
-    let native_codegen_backend = rustc_interface::util::get_codegen_backend(
+    let mut native_codegen_backend = rustc_interface::util::get_codegen_backend(
         &early_dcx,
         &sess.opts.sysroot,
         None,
         &sess.target,
     );
-    native_codegen_backend.init(sess);
+    let _ = native_codegen_backend.init(sess);
 
     Box::new(MiriCodegenBackend { native: native_codegen_backend, dummy: DummyCodegenBackend, dep })
 }
@@ -159,7 +159,10 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
         // Obtain and complete the Miri configuration.
         let mut config = self.miri_config.take().expect("after_analysis must only be called once");
         // Add filename to `miri` arguments.
-        config.args.insert(0, tcx.sess.io.input.filestem().to_string());
+        let file_name = tcx.sess.io.input.file_name(tcx.sess);
+        config.args.insert(0, file_name.prefer_local_unconditionally().to_string());
+        // And configure the executable.
+        config.current_exe = file_name.into_local_path().and_then(|p| p.canonicalize().ok());
 
         // Adjust working directory for interpretation.
         if let Some(cwd) = env::var_os("MIRI_CWD") {
@@ -215,12 +218,13 @@ impl CodegenBackend for MiriCodegenBackend {
         "miri"
     }
 
-    fn target_config(&self, sess: &Session) -> TargetConfig {
+    fn target_config(&self, sess: &EarlySession) -> TargetConfig {
         let native_target_config = self.native.target_config(sess);
         TargetConfig {
             internal_target_features: native_target_config.internal_target_features,
 
             // The basic types and ABI always work.
+            has_reliable_f16b: true,
             has_reliable_f16: true,
             has_reliable_f128: true,
             // We always provide the f16 intrinsics, but some are provided via the host,
@@ -364,8 +368,9 @@ fn run_compiler_and_exit(
     rustc_driver::install_ctrlc_handler();
 
     // Invoke compiler, catch any unwinding panics and handle return code.
-    let exit_code =
-        rustc_driver::catch_with_exit_code(move || rustc_driver::run_compiler(args, callbacks));
+    let exit_code = rustc_driver::catch_with_exit_code(move || {
+        rustc_driver::compiler_entrypoint(args, callbacks)
+    });
     exit(if exit_code == ExitCode::SUCCESS {
         rustc_driver::EXIT_SUCCESS
     } else {

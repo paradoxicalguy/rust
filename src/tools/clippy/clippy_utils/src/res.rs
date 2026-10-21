@@ -1,4 +1,6 @@
-use rustc_hir::attrs::lang_items::LangItem;
+//! Utilities for node resolution.
+
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{
@@ -11,6 +13,7 @@ use rustc_span::{Ident, Symbol};
 
 /// Either a `HirId` or a type which can be identified by one.
 pub trait HasHirId: Copy {
+    /// Returns the [`HirId`] identifying `self`.
     fn hir_id(self) -> HirId;
 }
 impl HasHirId for HirId {
@@ -28,6 +31,7 @@ impl HasHirId for &Expr<'_> {
 
 type DefRes = (DefKind, DefId);
 
+/// Either a [`TypeckResults`] or a type that may contain one.
 pub trait MaybeTypeckRes<'tcx> {
     /// Gets the contained `TypeckResults`.
     ///
@@ -515,6 +519,7 @@ impl<'a, T: MaybeResPath<'a>> MaybeResPath<'a> for Option<T> {
 
 /// A type which may either contain a `DefId` or be referred to by a `DefId`.
 pub trait MaybeDef: Copy {
+    /// Gets the [`DefId`] contained by or referring to `self`
     fn opt_def_id(self) -> Option<DefId>;
 
     /// Gets this definition's id and kind. This will lookup the kind in the def
@@ -576,7 +581,7 @@ pub trait MaybeDef: Copy {
     #[inline]
     fn assoc_parent<'tcx>(self, tcx: &impl HasTyCtxt<'tcx>) -> Option<DefId> {
         match self.opt_def(tcx) {
-            Some((DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy, id)) => tcx.tcx().opt_parent(id),
+            Some((DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy, id)) => tcx.tcx().opt_parent(id),
             _ => None,
         }
     }

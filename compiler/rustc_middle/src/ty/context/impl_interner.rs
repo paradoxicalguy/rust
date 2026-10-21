@@ -2,22 +2,23 @@
 
 use std::{debug_assert_matches, fmt};
 
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::intern::Interned;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, Span, Symbol, bug};
 use rustc_type_ir::lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem};
 use rustc_type_ir::solve::CanonicalInputData;
 use rustc_type_ir::{
     BoundVar, CollectAndApply, DebruijnIndex, Interner, RegionVid, TypeFoldable, Unnormalized,
-    VisitorResult, search_graph, try_visit,
+    VisitorResult, WithCachedTypeInfo, search_graph, try_visit,
 };
 
 use crate::dep_graph::{DepKind, DepNodeIndex};
 use crate::infer::canonical::CanonicalVarKinds;
+use crate::mir::interpret::Scalar;
 use crate::traits::cache::WithDepNode;
 use crate::traits::solve::{
     self, CanonicalInput, ExternalConstraints, ExternalConstraintsData, QueryResult, inspect,
@@ -66,6 +67,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type GenericArg = ty::GenericArg<'tcx>;
     type Term = ty::Term<'tcx>;
     type BoundVarKinds = &'tcx List<ty::BoundVariableKind<'tcx>>;
+    type TypingEnv = ty::TypingEnv<'tcx>;
 
     type PredefinedOpaques = solve::PredefinedOpaques<'tcx>;
 
@@ -109,15 +111,16 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type Pat = Pattern<'tcx>;
     type PatList = &'tcx List<Pattern<'tcx>>;
     type Safety = hir::Safety;
-    type Const = ty::Const<'tcx>;
-    type Consts = &'tcx List<Self::Const>;
+    type Consts = &'tcx List<ty::Const<'tcx>>;
 
     type ParamConst = ty::ParamConst;
     type ValueConst = ty::Value<'tcx>;
     type ExprConst = ty::Expr<'tcx>;
     type ValTree = ty::ValTree<'tcx>;
     type ScalarInt = ty::ScalarInt;
+    type Scalar = Scalar;
     type InternedRegionKind = Interned<'tcx, ty::RegionKind<'tcx>>;
+    type InternedConstKind = Interned<'tcx, WithCachedTypeInfo<ty::ConstKind<'tcx>>>;
     type EarlyParamRegion = ty::EarlyParamRegion;
     type LateParamRegionKind = ty::LateParamRegionKind;
 
@@ -207,9 +210,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
             ty::AliasConstKind::Anon { .. } => None,
         }
     }
-    fn anon_const_kind(self, def_id: DefId) -> ty::AnonConstKind {
-        self.anon_const_kind(def_id)
-    }
 
     fn def_span(self, def_id: DefId) -> Span {
         self.def_span(def_id)
@@ -220,77 +220,12 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.adt_def(adt_def_id)
     }
 
-    fn alias_const_kind_from_def_id(
-        self,
-        def_id: Self::DefId,
-        inherent_args: ty::AliasConstInherentArgsKind,
-    ) -> ty::AliasConstKind<'tcx> {
-        match self.def_kind(def_id) {
-            DefKind::AssocConst { .. } => {
-                if let DefKind::Impl { of_trait: false } = self.def_kind(self.parent(def_id)) {
-                    match inherent_args {
-                        ty::AliasConstInherentArgsKind::WithSelf => {
-                            ty::AliasConstKind::InherentSelf { def_id }
-                        }
-                        ty::AliasConstInherentArgsKind::Impl => {
-                            ty::AliasConstKind::InherentImpl { def_id }
-                        }
-                    }
-                } else {
-                    ty::AliasConstKind::Projection { def_id }
-                }
-            }
-            DefKind::Const { .. } => ty::AliasConstKind::Free { def_id },
-            DefKind::AnonConst | DefKind::Ctor(_, CtorKind::Const) => {
-                ty::AliasConstKind::Anon { def_id }
-            }
-            kind => bug!("unexpected DefKind in AliasConst: {kind:?}"),
-        }
-    }
-
-    fn alias_term_kind_from_def_id(
-        self,
-        def_id: DefId,
-        inherent_args: ty::AliasConstInherentArgsKind,
-    ) -> ty::AliasTermKind<'tcx> {
-        match self.def_kind(def_id) {
-            DefKind::AssocTy => {
-                if let DefKind::Impl { of_trait: false } = self.def_kind(self.parent(def_id)) {
-                    ty::AliasTermKind::InherentTy { def_id }
-                } else {
-                    ty::AliasTermKind::ProjectionTy { def_id }
-                }
-            }
-            DefKind::AssocConst { .. } => {
-                if let DefKind::Impl { of_trait: false } = self.def_kind(self.parent(def_id)) {
-                    match inherent_args {
-                        ty::AliasConstInherentArgsKind::WithSelf => {
-                            ty::AliasTermKind::InherentConstSelf { def_id }
-                        }
-                        ty::AliasConstInherentArgsKind::Impl => {
-                            ty::AliasTermKind::InherentConstImpl { def_id }
-                        }
-                    }
-                } else {
-                    ty::AliasTermKind::ProjectionConst { def_id }
-                }
-            }
-            DefKind::OpaqueTy => ty::AliasTermKind::OpaqueTy { def_id },
-            DefKind::TyAlias => ty::AliasTermKind::FreeTy { def_id },
-            DefKind::Const { .. } => ty::AliasTermKind::FreeConst { def_id },
-            DefKind::AnonConst | DefKind::Ctor(_, CtorKind::Const) => {
-                ty::AliasTermKind::AnonConst { def_id }
-            }
-            kind => bug!("unexpected DefKind in AliasTy: {kind:?}"),
-        }
-    }
-
     fn trait_ref_and_own_args_for_alias(
         self,
         def_id: DefId,
         args: ty::GenericArgsRef<'tcx>,
     ) -> (ty::TraitRef<'tcx>, &'tcx [ty::GenericArg<'tcx>]) {
-        debug_assert_matches!(self.def_kind(def_id), DefKind::AssocTy | DefKind::AssocConst { .. });
+        debug_assert_matches!(self.def_kind(def_id), DefKind::AssocTy | DefKind::AssocConst);
         let trait_def_id = self.parent(def_id);
         debug_assert_matches!(self.def_kind(trait_def_id), DefKind::Trait);
         let trait_ref = ty::TraitRef::from_assoc(self, trait_def_id, args);
@@ -355,6 +290,10 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         T: CollectAndApply<Ty<'tcx>, &'tcx List<Ty<'tcx>>>,
     {
         self.mk_type_list_from_iter(args)
+    }
+
+    fn mk_ct_from_kind(self, kind: ty::ConstKind<'tcx>) -> ty::Const<'tcx> {
+        self.mk_ct_from_kind(kind)
     }
 
     fn projection_parent(self, def_id: Self::TraitAssocTermId) -> Self::TraitId {
@@ -476,6 +415,10 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.impl_super_outlives(impl_def_id)
     }
 
+    fn supertrait_def_ids(self, trait_def_id: DefId) -> impl Iterator<Item = DefId> {
+        rustc_type_ir::elaborate::supertrait_def_ids(self, trait_def_id)
+    }
+
     fn impl_is_const(self, def_id: DefId) -> bool {
         debug_assert_matches!(self.def_kind(def_id), DefKind::Impl { of_trait: true });
         self.is_conditionally_const(def_id)
@@ -549,10 +492,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn is_trait_lang_item(self, def_id: DefId, lang_item: SolverTraitLangItem) -> bool {
         self.is_lang_item(def_id, solver_trait_lang_item_to_lang_item(lang_item))
-    }
-
-    fn is_adt_lang_item(self, def_id: DefId, lang_item: SolverAdtLangItem) -> bool {
-        self.is_lang_item(def_id, solver_adt_lang_item_to_lang_item(lang_item))
     }
 
     fn is_default_trait(self, def_id: DefId) -> bool {
@@ -637,6 +576,10 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.trait_is_auto(trait_def_id)
     }
 
+    fn trait_is_marker(self, trait_def_id: DefId) -> bool {
+        self.trait_def(trait_def_id).is_marker
+    }
+
     fn trait_is_coinductive(self, trait_def_id: DefId) -> bool {
         self.trait_is_coinductive(trait_def_id)
     }
@@ -655,10 +598,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn trait_is_unsafe(self, trait_def_id: Self::DefId) -> bool {
         self.trait_def(trait_def_id).safety.is_unsafe()
-    }
-
-    fn is_impl_trait_in_trait(self, def_id: DefId) -> bool {
-        self.is_impl_trait_in_trait(def_id)
     }
 
     fn delay_bug(self, msg: impl ToString) -> ErrorGuaranteed {
@@ -736,18 +675,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         })
     }
 
-    fn get_anon_re_bounds_lifetime(self, idx: usize, var_idx: usize) -> Option<Region<'tcx>> {
-        if let Some(inner) = self.lifetimes.anon_re_bounds.get(idx) {
-            inner.get(var_idx).copied()
-        } else {
-            None
-        }
-    }
-
-    fn get_anon_re_canonical_bounds_lifetime(self, idx: usize) -> Option<Region<'tcx>> {
-        self.lifetimes.anon_re_canonical_bounds.get(idx).copied()
-    }
-
     fn get_re_static_lifetime(self) -> Region<'tcx> {
         self.lifetimes.re_static
     }
@@ -772,7 +699,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     ) -> Region<'tcx> {
         // Use a pre-interned one when possible.
         if let ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon } = bound_region
-            && let Some(inner) = self.lifetimes.anon_re_bounds.get(debruijn.as_usize())
+            && let Some(inner) = self.lifetimes.re_bound_bound_anons.get(debruijn.as_usize())
             && let Some(re) = inner.get(var.as_usize()).copied()
         {
             re
@@ -783,7 +710,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn intern_canonical_bound(self, var: BoundVar) -> Region<'tcx> {
         // Use a pre-interned one when possible.
-        if let Some(re) = self.lifetimes.anon_re_canonical_bounds.get(var.as_usize()).copied() {
+        if let Some(re) = self.lifetimes.re_bound_canonical_anons.get(var.as_usize()).copied() {
             re
         } else {
             self.intern_region(ty::ReBound(
@@ -792,11 +719,17 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
             ))
         }
     }
+
+    fn intern_valtree(self, valtree_kind: ty::ValTreeKind<TyCtxt<'tcx>>) -> ty::ValTree<'tcx> {
+        self.intern_valtree(valtree_kind)
+    }
+
+    fn const_zst(self) -> ty::ValTree<'tcx> {
+        self.consts.valtree_zst
+    }
 }
 
-impl<'tcx, T: std::fmt::Debug + Clone + Copy> rustc_type_ir::intern::Interned<TyCtxt<'tcx>>
-    for Interned<'tcx, T>
-{
+impl<'tcx, T: Clone + Copy> rustc_type_ir::intern::Interned<TyCtxt<'tcx>> for Interned<'tcx, T> {
     type Value = T;
     fn get(self) -> T {
         *self.0
@@ -874,6 +807,7 @@ bidirectional_lang_item_map! {
     FnMut,
     FnOnce,
     FnPtrTrait,
+    Freeze,
     FusedIterator,
     Future,
     Iterator,

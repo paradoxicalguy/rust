@@ -24,12 +24,13 @@ use itertools::Itertools;
 use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
+use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{self as hir, BindingMode, ByRef, HirId, ItemLocalId, Node, find_attr};
+use rustc_hir::{self as hir, BindingMode, ByRef, HirId, ItemLocalId, Node};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
@@ -38,8 +39,7 @@ use rustc_middle::middle::region;
 use rustc_middle::mir::*;
 use rustc_middle::thir::{self, ExprId, LocalVarId, Param, ParamId, PatKind, Thir};
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt, TypeVisitableExt, TypingMode};
-use rustc_middle::{bug, span_bug};
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, bug, span_bug};
 
 use crate::builder::expr::as_place::PlaceBuilder;
 use crate::builder::scope::LintLevel;
@@ -637,8 +637,8 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
 
     let (inputs, output, coroutine) = match tcx.def_kind(def_id) {
-        DefKind::Const { .. }
-        | DefKind::AssocConst { .. }
+        DefKind::Const
+        | DefKind::AssocConst
         | DefKind::AnonConst
         | DefKind::Static { .. }
         | DefKind::GlobalAsm => {
@@ -652,7 +652,15 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
             (sig.inputs().to_vec(), sig.output(), None)
         }
         DefKind::Closure => {
-            let closure_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
+            let closure_ty = tcx.type_of(def_id).instantiate_identity().skip_normalization();
+            let closure_ty = if tcx.next_trait_solver_globally() {
+                // Like `construct_fn`, closure tys were already normalized during writeback and
+                // wrapping them in an `EarlyBinder` makes them non-rigid, so we just need to
+                // restore their rigidness again.
+                ty::set_aliases_to_rigid(tcx, closure_ty)
+            } else {
+                closure_ty
+            };
             match closure_ty.kind() {
                 ty::Closure(_, args) => {
                     let args = args.as_closure();

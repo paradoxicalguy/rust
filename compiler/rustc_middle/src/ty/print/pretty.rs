@@ -6,16 +6,16 @@ use std::ops::{Deref, DerefMut};
 use rustc_abi::{ExternAbi, Size};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_crate_store::{ExternCrate, ExternCrateSource};
 use rustc_data_structures::fx::{FxIndexMap, IndexEntry};
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{self, CtorKind, DefKind, Namespace};
 use rustc_hir::def_id::{DefIdMap, DefIdSet, LOCAL_CRATE, ModId};
 use rustc_hir::definitions::{DefKey, DefPathDataName};
 use rustc_macros::{Lift, extension};
-use rustc_span::{Ident, RemapPathScopeComponents, Symbol, kw, sym};
+use rustc_span::{Ident, RemapPathScopeComponents, Symbol, bug, kw, sym};
 use rustc_structures::Limit;
 use rustc_type_ir::{FieldInfo, Unnormalized, Upcast as _, elaborate};
 use smallvec::SmallVec;
@@ -288,7 +288,8 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         f(value.as_ref().skip_binder(), self)
     }
 
-    /// Prints comma-separated elements.
+    /// Prints comma-separated elements. If `comma_sep_has_space` is `true`, there is a space after
+    /// each comma.
     fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
     where
         T: Print<Self>,
@@ -296,11 +297,19 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         if let Some(first) = elems.next() {
             first.print(self)?;
             for elem in elems {
-                self.write_str(", ")?;
+                if self.comma_sep_has_space() {
+                    self.write_str(", ")?;
+                } else {
+                    self.write_str(",")?;
+                }
                 elem.print(self)?;
             }
         }
         Ok(())
+    }
+
+    fn comma_sep_has_space(&self) -> bool {
+        true
     }
 
     /// Prints `{f: t}` or `{f as t}` depending on the `cast` argument
@@ -409,7 +418,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
             return Ok(true);
         }
         if let Some(symbol) = key.get_opt_name() {
-            if let DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy = kind
+            if let DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy = kind
                 && let Some(parent) = self.tcx().opt_parent(def_id)
                 && let parent_key = self.tcx().def_key(parent)
                 && let Some(symbol) = parent_key.get_opt_name()
@@ -434,7 +443,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
             | DefKind::Trait
             | DefKind::TyAlias
             | DefKind::Fn
-            | DefKind::Const { .. }
+            | DefKind::Const
             | DefKind::Static { .. } = kind
             {
             } else {
@@ -1503,14 +1512,26 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         let splatted_arg_index = splatted.map(usize::from);
         let mut input_iter = inputs.iter().copied();
         if let Some(index) = splatted_arg_index {
-            self.comma_sep((&mut input_iter).take(usize::from(index)))?;
-            write!(self, ", #[rustc_splat]")?;
+            self.comma_sep((&mut input_iter).take(index))?;
+            // Splitting the comma-separated list can miss a comma, but we only need that comma if
+            // there are arguments before the splat.
+            // FIXME(splat): if splatting becomes part of the type, we can remove this hack
+            if index > 0 {
+                if self.comma_sep_has_space() {
+                    write!(self, ", ")?;
+                } else {
+                    write!(self, ",")?;
+                }
+            }
+            write!(self, "#[rustc_splat] ")?;
             self.comma_sep(input_iter)?;
         } else {
             self.comma_sep(input_iter)?;
         }
         if c_variadic {
             if !inputs.is_empty() {
+                // In legacy mangling, most comma-separated lists have no spaces. But here we print
+                // a space before the `...` for readability.
                 write!(self, ", ")?;
             }
             write!(self, "...")?;
@@ -1967,6 +1988,8 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             let mut first = true;
                             for (field_def, field) in iter::zip(&variant_def.fields, fields) {
                                 if !first {
+                                    // FIXME(legacy mangling): if this appears, should we enable
+                                    // spaces depending on `comma_sep_has_space`?
                                     write!(self, ", ")?;
                                 }
                                 write!(self, "{}: ", field_def.name)?;
@@ -2395,12 +2418,9 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
     fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
         self.empty_path = true;
         if cnum == LOCAL_CRATE && !with_resolve_crate_name() {
-            if self.tcx.sess.at_least_rust_2018() {
-                // We add the `crate::` keyword on Rust 2018, only when desired.
-                if with_crate_prefix() {
-                    write!(self, "{}", kw::Crate)?;
-                    self.empty_path = false;
-                }
+            if with_crate_prefix() {
+                write!(self, "{}", kw::Crate)?;
+                self.empty_path = false;
             }
         } else {
             write!(self, "{}", self.tcx.crate_name(cnum))?;
@@ -3143,8 +3163,7 @@ macro_rules! define_print_and_forward_display {
 
 forward_display_to_print! {
     Ty<'tcx>,
-    &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
-    ty::Const<'tcx>
+    &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>
 }
 
 define_print! {

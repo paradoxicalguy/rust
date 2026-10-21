@@ -150,9 +150,8 @@ macro_rules! shim_sig_arg {
         $this.tcx.types.bool
     };
     ($this:ident, *_) => {
-        // Pointee types usually don't matter so we allow it to be omitted.
         // Mutability does not matter for ABI.
-        $this.machine.layouts.mut_raw_ptr.ty
+        $this.machine.layouts.void_ptr_mut.ty
     };
     ($this:ident, *$($ty:tt)*) => {
         // Pointee types matter for varargs so we support explicitly giving them.
@@ -164,8 +163,8 @@ macro_rules! shim_sig_arg {
         )
     };
     ($this:ident, fn(..) -> _) => {
-        // We currently treat fn ptrs as ABI-compatible with data ptrs so we can just use a raw ptr.
-        $this.machine.layouts.const_raw_ptr.ty
+        // All function pointer types are the same on the ABI level so we don't care about arg/ret.
+        $this.machine.layouts.fn_ptr.ty
     };
     ($this:ident, &[$($ty:tt)*]) => {
         rustc_middle::ty::Ty::new_ref(
@@ -285,7 +284,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             throw_machine_stop!(TerminationInfo::SymbolShimClashing {
                 link_name,
-                span: this.tcx.def_span(instance.def_id()).data(),
+                span: this.tcx.def_span(instance.def_id()),
             })
         }
         interp_ok(())
@@ -324,13 +323,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     }
 
     /// Check that the given `caller_fn_abi` matches the expected ABI described by `shim_sig`, and
-    /// then returns the list of arguments.
-    fn check_shim_sig<'a, const N: usize>(
+    /// then returns the list of arguments, transmuted to the expected (shim) types.
+    fn check_shim_sig<const N: usize>(
         &self,
         shim_sig: fn(&MiriInterpCx<'tcx>) -> ShimSig<'tcx, N>,
         // We take these as a tuple so that this takes less space on the caller side.
-        (link_name, caller_fn_abi, caller_args): (Symbol, &FnAbi<'tcx, Ty<'tcx>>, &'a [OpTy<'tcx>]),
-    ) -> InterpResult<'tcx, &'a [OpTy<'tcx>; N]> {
+        (link_name, caller_fn_abi, caller_args): (Symbol, &FnAbi<'tcx, Ty<'tcx>>, &[OpTy<'tcx>]),
+    ) -> InterpResult<'tcx, [OpTy<'tcx>; N]> {
         let this = self.eval_context_ref();
 
         // Compute callee ABI.
@@ -343,20 +342,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.check_shim_symbol_clash(link_name)?;
 
         // Return arguments.
-        if let Ok(ops) = caller_args.try_into() {
-            return interp_ok(ops);
-        }
-        unreachable!()
+        let transmuted = std::array::try_from_fn(|i| {
+            caller_args[i].transmute(callee_fn_abi.args[i].layout, this)
+        })?;
+        interp_ok(transmuted)
     }
 
     /// Check that the given `caller_fn_abi` matches the expected ABI described by `shim_sig`, and
     /// then returns the list of fixed and variadic arguments in separate lists.
+    /// The fixed arguments are transmuted to the expected (shim) types.
     fn check_shim_sig_variadic<'a, const N: usize>(
         &self,
         shim_sig: fn(&MiriInterpCx<'tcx>) -> ShimSig<'tcx, N>,
         // We take these as a tuple so that this takes less space on the caller side.
         (link_name, caller_fn_abi, caller_args): (Symbol, &FnAbi<'tcx, Ty<'tcx>>, &'a [OpTy<'tcx>]),
-    ) -> InterpResult<'tcx, (&'a [OpTy<'tcx>; N], Varargs<'tcx, 'a>)> {
+    ) -> InterpResult<'tcx, ([OpTy<'tcx>; N], Varargs<'tcx, 'a>)> {
         let this = self.eval_context_ref();
 
         // Compute callee ABI.
@@ -368,21 +368,25 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         check_shim_abi(this, link_name, callee_fn_abi, caller_fn_abi)?;
         this.check_shim_symbol_clash(link_name)?;
 
-        // Return arguments.
-        if let Some((fixed, var)) = caller_args.split_first_chunk() {
-            return interp_ok((fixed, Varargs { args: var, already_gone: N }));
+        // Return transmuted arguments.
+        if let Some((fixed, var)) = caller_args.split_first_chunk::<N>() {
+            let transmuted = std::array::try_from_fn(|i| {
+                fixed[i].transmute(callee_fn_abi.args[i].layout, this)
+            })?;
+            return interp_ok((transmuted, Varargs { args: var, already_gone: N }));
         }
         unreachable!()
     }
 
     /// Fetches `N` arguments from `varargs`, checking their types.
     /// Also returns the remaining varargs.
+    /// The returned arguments are transmuted to the expected types.
     fn check_varargs<'a, const N: usize>(
         &self,
         tys: fn(&MiriInterpCx<'tcx>) -> [Ty<'tcx>; N],
         varargs: Varargs<'tcx, 'a>,
         fn_name: &str,
-    ) -> InterpResult<'tcx, (&'a [OpTy<'tcx>; N], Varargs<'tcx, 'a>)> {
+    ) -> InterpResult<'tcx, ([OpTy<'tcx>; N], Varargs<'tcx, 'a>)> {
         let this = self.eval_context_ref();
         let tys = tys(this);
 
@@ -429,7 +433,15 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
         }
 
-        interp_ok((now, Varargs { args: tail, already_gone: varargs.already_gone.strict_add(N) }))
+        let transmuted = std::array::try_from_fn(|i| {
+            let layout = this.layout_of(tys[i])?;
+            now[i].transmute(layout, this)
+        })?;
+
+        interp_ok((
+            transmuted,
+            Varargs { args: tail, already_gone: varargs.already_gone.strict_add(N) },
+        ))
     }
 
     /// Check that the given function has the expected amount of arguments, and then

@@ -927,8 +927,15 @@ impl ToJson for SmallDataThresholdSupport {
 
 crate::target_spec_enum! {
     pub enum MergeFunctions {
+        /// Disable function merging entirely.
         Disabled = "disabled",
+        /// Allow function merging via trampolines (i.e., functions can be implemented
+        /// in terms of a jump to an unrelated function with identical behavior), but
+        /// not via object-format-level global aliases.
         Trampolines = "trampolines",
+        /// (Default) allow function merging via either trampolines or (object format
+        /// level) global aliases. LLVM will normally use global aliases for merging, but
+        /// trampolines are also permissible.
         Aliases = "aliases",
     }
 
@@ -1504,6 +1511,7 @@ supported_targets! {
     ("thumbv7a-pc-windows-msvc", thumbv7a_pc_windows_msvc),
     ("thumbv7a-uwp-windows-msvc", thumbv7a_uwp_windows_msvc),
 
+    ("wasm32-none-component", wasm32_none_component),
     ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
     ("wasm32-unknown-unknown", wasm32_unknown_unknown),
     ("wasm32v1-none", wasm32v1_none),
@@ -1650,6 +1658,8 @@ supported_targets! {
 
     ("aarch64-unknown-teeos", aarch64_unknown_teeos),
 
+    ("aarch64-unknown-qtee", aarch64_unknown_qtee),
+
     ("mips64-openwrt-linux-musl", mips64_openwrt_linux_musl),
 
     ("aarch64-unknown-nto-qnx700", aarch64_unknown_nto_qnx700),
@@ -1695,6 +1705,9 @@ supported_targets! {
     ("i686-oe-linux-gnu", i686_oe_linux_gnu),
     ("riscv64-oe-linux-gnu", riscv64_oe_linux_gnu),
     ("x86_64-oe-linux-gnu", x86_64_oe_linux_gnu),
+
+    ("aarch64-unknown-hyperlight", aarch64_unknown_hyperlight),
+    ("x86_64-unknown-hyperlight", x86_64_unknown_hyperlight),
 }
 
 /// Cow-Vec-Str: Cow<'static, [Cow<'static, str>]>
@@ -1850,6 +1863,7 @@ crate::target_spec_enum! {
         Hermit = "hermit",
         Horizon = "horizon",
         Hurd = "hurd",
+        Hyperlight = "hyperlight",
         Illumos = "illumos",
         IOs = "ios",
         L4Re = "l4re",
@@ -1867,6 +1881,7 @@ crate::target_spec_enum! {
         Psp = "psp",
         Psx = "psx",
         Qnx = "qnx",
+        Qtee = "qtee",
         Qurt = "qurt",
         Redox = "redox",
         Rtems = "rtems",
@@ -1950,7 +1965,6 @@ crate::target_spec_enum! {
         Spe = "spe",
         Uwp = "uwp",
         VecDefault = "vec-default",
-        VecExtAbi = "vec-extabi",
         X32 = "x32",
         V8Plus = "v8plus",
         Unspecified = "",
@@ -2262,11 +2276,12 @@ pub struct TargetOptions {
     /// Extra arguments to pass to the external assembler (when used)
     pub asm_args: StaticCow<[StaticCow<str>]>,
 
-    /// Default CPU to pass to LLVM. Corresponds to `llc -mcpu=$cpu`. Defaults
-    /// to "generic".
+    /// Default CPU to pass to LLVM. Corresponds to `llc -mcpu=$cpu`. Must be a name the backend
+    /// accepts. Defaults to "generic" (which some backends won't accept).
     pub cpu: StaticCow<str>,
-    /// Whether a cpu needs to be explicitly set.
-    /// Set to true if there is no default cpu. Defaults to false.
+    /// Whether a cpu needs to be explicitly set via `-Ctarget-cpu` for codegen to run. (Even if
+    /// true, `cpu` is still consulted on non-codegen paths such as cfg/feature computation.)
+    /// Defaults to false.
     pub need_explicit_cpu: bool,
     /// Whether `-Ctarget-cpu` is treated as a target modifier. If this is set
     /// all crates that are linked together must have been compiled with the
@@ -2530,7 +2545,7 @@ pub struct TargetOptions {
     /// rustc and not forwarded to LLVM.
     pub rustc_abi: Option<RustcAbi>,
 
-    /// Whether or not RelaxElfRelocation flag will be passed to the linker
+    /// Whether or not X86RelaxRelocations flag will be passed to LLVM (x86 only).
     pub relax_elf_relocations: bool,
 
     /// Additional arguments to pass to LLVM, similar to the `-C llvm-args` codegen option.

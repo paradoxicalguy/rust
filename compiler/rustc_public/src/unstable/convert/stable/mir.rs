@@ -1,9 +1,10 @@
 //! Conversion of internal Rust compiler `mir` items to stable ones.
 
+use rustc_middle::mir;
 use rustc_middle::mono::MonoItem;
-use rustc_middle::{bug, mir};
 use rustc_public_bridge::context::CompilerCtxt;
 use rustc_public_bridge::{Tables, bridge};
+use rustc_span::bug;
 
 use crate::compiler_interface::BridgeTys;
 use crate::mir::alloc::GlobalAlloc;
@@ -732,7 +733,7 @@ impl<'tcx> Stable<'tcx> for mir::TerminatorKind<'tcx> {
     ) -> Self::T {
         use crate::mir::TerminatorKind;
         match self {
-            mir::TerminatorKind::Goto { target } => {
+            mir::TerminatorKind::Goto { target, .. } => {
                 TerminatorKind::Goto { target: target.as_usize() }
             }
             mir::TerminatorKind::SwitchInt { discr, targets } => TerminatorKind::SwitchInt {

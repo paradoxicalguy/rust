@@ -123,8 +123,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         match method {
             SpecialAllocatorMethod::Alloc | SpecialAllocatorMethod::AllocZeroed => {
-                let [size, align] = this.check_shim_sig(
-                    shim_sig!(extern "Rust" fn(usize, core::mem::Alignment) -> *_),
+                let [size, align] = &this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize, core::mem::Alignment) -> *()),
                     (link_name, abi, args),
                 )?;
                 let size = this.read_target_usize(size)?;
@@ -146,8 +146,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_pointer(ptr, dest)
             }
             SpecialAllocatorMethod::Dealloc => {
-                let [ptr, old_size, align] = this.check_shim_sig(
-                    shim_sig!(extern "Rust" fn(*_, usize, core::mem::Alignment) -> ()),
+                let [ptr, old_size, align] = &this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(*(), usize, core::mem::Alignment) -> ()),
                     (link_name, abi, args),
                 )?;
                 let ptr = this.read_pointer(ptr)?;
@@ -162,8 +162,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )
             }
             SpecialAllocatorMethod::Realloc => {
-                let [ptr, old_size, align, new_size] = this.check_shim_sig(
-                    shim_sig!(extern "Rust" fn(*_, usize, core::mem::Alignment, usize) -> *_),
+                let [ptr, old_size, align, new_size] = &this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(*(), usize, core::mem::Alignment, usize) -> *()),
                     (link_name, abi, args),
                 )?;
                 let ptr = this.read_pointer(ptr)?;
@@ -203,7 +203,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         size: &OpTy<'tcx>,
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-        let memptr = this.deref_pointer_as(memptr, this.machine.layouts.mut_raw_ptr)?;
+        let memptr = this.deref_pointer_as(memptr, this.machine.layouts.unit_ptr_mut)?;
         let align = this.read_target_usize(align)?;
         let size = this.read_target_usize(size)?;
 

@@ -8,14 +8,13 @@ use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, ParamName};
-use rustc_middle::bug;
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::RegionHighlightMode;
 use rustc_middle::ty::{
     self, IsSuggestable, Region, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
 };
-use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw, sym};
+use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, bug, kw, sym};
 use tracing::{debug, instrument};
 
 use super::ObligationCauseAsDiagArg;
@@ -73,10 +72,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     RegionResolutionError::ConcreteFailure(origin, sub, sup) => {
                         if sub.is_placeholder() || sup.is_placeholder() {
                             self.report_placeholder_failure(generic_param_scope, origin, sub, sup)
-                                .emit()
+                                .emit_err()
                         } else {
                             self.report_concrete_failure(generic_param_scope, origin, sub, sup)
-                                .emit()
+                                .emit_err()
                         }
                     }
 
@@ -105,7 +104,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                 sub_r,
                                 sup_r,
                             )
-                            .emit()
+                            .emit_err()
                         } else if sup_r.is_placeholder() {
                             self.report_placeholder_failure(
                                 generic_param_scope,
@@ -113,7 +112,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                 sub_r,
                                 sup_r,
                             )
-                            .emit()
+                            .emit_err()
                         } else {
                             self.report_sub_sup_conflict(
                                 generic_param_scope,
@@ -148,7 +147,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             sub_r,
                             sup_r,
                         )
-                        .emit()
+                        .emit_err()
                     }
 
                     RegionResolutionError::CannotNormalize(clause, origin) => {
@@ -157,7 +156,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         self.tcx
                             .dcx()
                             .struct_span_err(origin.span(), format!("cannot normalize `{clause}`"))
-                            .emit()
+                            .emit_err()
                     }
                 }
             };
@@ -211,12 +210,17 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         };
 
         // sort the errors by span, for better error message stability.
-        errors.sort_by_key(|u| match *u {
-            RegionResolutionError::ConcreteFailure(ref sro, _, _) => sro.span(),
-            RegionResolutionError::GenericBoundFailure(ref sro, _, _) => sro.span(),
-            RegionResolutionError::SubSupConflict(_, ref rvo, _, _, _, _, _) => rvo.span(),
-            RegionResolutionError::UpperBoundUniverseConflict(_, ref rvo, _, _, _) => rvo.span(),
-            RegionResolutionError::CannotNormalize(_, ref sro) => sro.span(),
+        errors.sort_by_key(|u| {
+            match *u {
+                RegionResolutionError::ConcreteFailure(ref sro, _, _) => sro.span(),
+                RegionResolutionError::GenericBoundFailure(ref sro, _, _) => sro.span(),
+                RegionResolutionError::SubSupConflict(_, ref rvo, _, _, _, _, _) => rvo.span(),
+                RegionResolutionError::UpperBoundUniverseConflict(_, ref rvo, _, _, _) => {
+                    rvo.span()
+                }
+                RegionResolutionError::CannotNormalize(_, ref sro) => sro.span(),
+            }
+            .lo_hi()
         });
         errors
     }
@@ -290,7 +294,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             SubregionOrigin::CheckAssociatedTypeBounds { ref parent, .. } => {
                 self.note_region_origin(err, parent);
             }
-            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span, _) => {
                 RegionOriginNote::Plain { span, msg: msg!("...so that the where clause holds") }
                     .add_to_diag(err);
             }
@@ -430,7 +434,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 self.dcx().create_err(FulfillReqLifetime {
                     span,
-                    ty: self.resolve_vars_if_possible(ty),
+                    ty: self.deeply_resolve_ignoring_regions(ty),
                     note,
                 })
             }
@@ -495,7 +499,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 self.dcx().create_err(RefLongerThanData {
                     span,
-                    ty: self.resolve_vars_if_possible(ty),
+                    ty: self.deeply_resolve_ignoring_regions(ty),
                     notes: pointer_valid.into_iter().chain(data_valid).collect(),
                 })
             }
@@ -547,7 +551,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 err
             }
-            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span, _) => {
                 let instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -705,7 +709,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         sub: Region<'tcx>,
     ) -> ErrorGuaranteed {
         self.construct_generic_bound_failure(generic_param_scope, span, origin, bound_kind, sub)
-            .emit()
+            .emit_err()
     }
 
     pub fn construct_generic_bound_failure(
@@ -841,39 +845,39 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             };
 
             let mut suggs = vec![];
-            let lt_name = self.suggest_name_region(generic_param_scope, sub, &mut suggs);
-
-            if let Some((sp, suggestion_type)) = type_param_sugg_span
-                && suggestion_scope == type_scope
-            {
-                match suggestion_type {
-                    LifetimeSuggestion::NeedsPlus(open_paren_sp) => {
-                        let suggestion = format!(" + {lt_name}");
-                        if let Some(open_paren_sp) = open_paren_sp {
-                            suggs.push((open_paren_sp, "(".to_string()));
-                            suggs.push((sp, format!("){suggestion}")));
-                        } else {
-                            suggs.push((sp, suggestion));
+            if let Some(lt_name) = self.suggest_name_region(generic_param_scope, sub, &mut suggs) {
+                if let Some((sp, suggestion_type)) = type_param_sugg_span
+                    && suggestion_scope == type_scope
+                {
+                    match suggestion_type {
+                        LifetimeSuggestion::NeedsPlus(open_paren_sp) => {
+                            let suggestion = format!(" + {lt_name}");
+                            if let Some(open_paren_sp) = open_paren_sp {
+                                suggs.push((open_paren_sp, "(".to_string()));
+                                suggs.push((sp, format!("){suggestion}")));
+                            } else {
+                                suggs.push((sp, suggestion));
+                            }
                         }
+                        LifetimeSuggestion::NeedsColon => suggs.push((sp, format!(": {lt_name}"))),
+                        LifetimeSuggestion::HasColon => suggs.push((sp, format!(" {lt_name}"))),
                     }
-                    LifetimeSuggestion::NeedsColon => suggs.push((sp, format!(": {lt_name}"))),
-                    LifetimeSuggestion::HasColon => suggs.push((sp, format!(" {lt_name}"))),
+                } else if let GenericKind::Alias(ref p) = bound_kind
+                    && let ty::Projection { def_id } = p.kind(self.tcx)
+                    && let DefKind::AssocTy = self.tcx.def_kind(def_id)
+                    && let Some(ty::ImplTraitInTraitData::Trait { .. }) =
+                        self.tcx.opt_rpitit_info(def_id)
+                {
+                    // The lifetime found in the `impl` is longer than the one on the RPITIT.
+                    // Do not suggest `<Type as Trait>::{opaque}: 'static`.
+                } else if let Some(generics) = self.tcx.hir_get_generics(suggestion_scope) {
+                    let pred = format!("{bound_kind}: {lt_name}");
+                    let suggestion = format!("{} {}", generics.add_where_or_trailing_comma(), pred);
+                    suggs.push((generics.tail_span_for_predicate_suggestion(), suggestion))
+                } else {
+                    let consider = format!("{msg} `{bound_kind}: {sub}`...");
+                    err.help(consider);
                 }
-            } else if let GenericKind::Alias(ref p) = bound_kind
-                && let ty::Projection { def_id } = p.kind
-                && let DefKind::AssocTy = self.tcx.def_kind(def_id)
-                && let Some(ty::ImplTraitInTraitData::Trait { .. }) =
-                    self.tcx.opt_rpitit_info(def_id)
-            {
-                // The lifetime found in the `impl` is longer than the one on the RPITIT.
-                // Do not suggest `<Type as Trait>::{opaque}: 'static`.
-            } else if let Some(generics) = self.tcx.hir_get_generics(suggestion_scope) {
-                let pred = format!("{bound_kind}: {lt_name}");
-                let suggestion = format!("{} {}", generics.add_where_or_trailing_comma(), pred);
-                suggs.push((generics.tail_span_for_predicate_suggestion(), suggestion))
-            } else {
-                let consider = format!("{msg} `{bound_kind}: {sub}`...");
-                err.help(consider);
             }
 
             if !suggs.is_empty() {
@@ -929,7 +933,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         generic_param_scope: LocalDefId,
         lifetime: Region<'tcx>,
         add_lt_suggs: &mut Vec<(Span, String)>,
-    ) -> String {
+    ) -> Option<String> {
         struct LifetimeReplaceVisitor<'a> {
             needle: hir::LifetimeKind,
             new_lt: &'a str,
@@ -949,7 +953,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 Some(info) if !lifetime.is_named(self.tcx) => {
                     (info.region_def_id.expect_local(), info.scope)
                 }
-                _ => return lifetime.get_name_or_anon(self.tcx).to_string(),
+                _ => return Some(lifetime.get_name(self.tcx)?.to_string()),
             };
 
         let new_lt = {
@@ -995,7 +999,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             .unwrap_or_else(|| (ast_generics.span, format!("<{new_lt}>")));
         add_lt_suggs.push(sugg);
 
-        new_lt
+        Some(new_lt)
     }
 
     fn report_sub_sup_conflict(
@@ -1052,7 +1056,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             return if sub_region.is_error() | sup_region.is_error() {
                 err.delay_as_bug()
             } else {
-                err.emit()
+                err.emit_err()
             };
         }
 
@@ -1069,7 +1073,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         );
 
         self.note_region_origin(&mut err, &sub_origin);
-        if sub_region.is_error() | sup_region.is_error() { err.delay_as_bug() } else { err.emit() }
+        if sub_region.is_error() | sup_region.is_error() {
+            err.delay_as_bug()
+        } else {
+            err.emit_err()
+        }
     }
 
     fn report_inference_failure(&self, var_origin: RegionVariableOrigin<'tcx>) -> Diag<'_> {
@@ -1377,6 +1385,15 @@ fn suggest_precise_capturing<'tcx>(
         hir::GenericBound::Use(args, span) => Some((args, span)),
         _ => None,
     }) {
+        // '_ is an elision marker, not a lifetime name, so it cannot appear twice in a
+        // capture list. the branch for opaques with no use<..> yet already skips captured
+        // lifetimes; do the same here to avoid suggesting use<'_, '_>.
+        if args.iter().any(|arg| {
+            matches!(arg, hir::PreciseCapturingArg::Lifetime(lt) if lt.ident.name == new_lifetime)
+        }) {
+            return;
+        }
+
         let last_lifetime_span = args.iter().rev().find_map(|arg| match arg {
             hir::PreciseCapturingArg::Lifetime(lt) => Some(lt.ident.span),
             _ => None,

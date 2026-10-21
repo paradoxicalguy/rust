@@ -1,8 +1,5 @@
 //! Constant evaluation details
 
-#[cfg(test)]
-mod tests;
-
 use base_db::Crate;
 use hir_def::{
     ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, StaticId,
@@ -21,7 +18,6 @@ use salsa::SalsaValue;
 use crate::{
     ParamEnvAndCrate, Span,
     db::{AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase},
-    display::DisplayTarget,
     generics::Generics,
     lower::LoweringMode,
     mir::{IsSigned, MirEvalError, MirLowerError, pad16},
@@ -39,25 +35,6 @@ use super::mir::interpret_mir;
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
     MirEvalError(MirEvalError<'db>),
-}
-
-impl ConstEvalError<'_> {
-    pub fn pretty_print(
-        &self,
-        f: &mut String,
-        db: &dyn HirDatabase,
-        span_formatter: impl Fn(span::FileId, span::TextRange) -> String,
-        display_target: DisplayTarget,
-    ) -> std::result::Result<(), std::fmt::Error> {
-        match self {
-            ConstEvalError::MirLowerError(e) => {
-                e.pretty_print(f, db, span_formatter, display_target)
-            }
-            ConstEvalError::MirEvalError(e) => {
-                e.pretty_print(f, db, span_formatter, display_target)
-            }
-        }
-    }
 }
 
 impl<'db> From<MirLowerError<'db>> for ConstEvalError<'db> {
@@ -125,7 +102,6 @@ fn intern_const_ref<'db>(
         {
             let u8_values = &interner.default_types().consts.u8_values;
             ValTreeKind::Branch(Consts::new_from_iter(
-                interner,
                 value.as_str().as_bytes().iter().map(|&byte| u8_values[usize::from(byte)]),
             ))
         }
@@ -253,7 +229,7 @@ pub fn try_const_usize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<u
             }
         },
         ConstKind::Value(val) => {
-            if val.ty == default_types(db).types.usize {
+            if val.ty == default_types().types.usize {
                 Some(val.value.inner().to_leaf().to_uint_unchecked())
             } else {
                 None
@@ -291,7 +267,7 @@ pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<i
             }
         },
         ConstKind::Value(val) => {
-            if val.ty == default_types(db).types.isize {
+            if val.ty == default_types().types.isize {
                 Some(val.value.inner().to_leaf().to_int_unchecked())
             } else {
                 None
@@ -347,10 +323,20 @@ pub(crate) fn path_to_const<'a, 'db>(
         | ValueNs::StructId(_)
         | ValueNs::EnumVariantId(_) => return Err(CreateConstError::ResolveToNonConst),
     };
-    let args = GenericArgs::empty(interner);
+    let args = GenericArgs::empty();
     Ok(Const::new_unevaluated(interner, UnevaluatedConst { def: konst.into(), args }))
 }
 
+/// `forbid_params_after` and `allow_anon_const_using_generic_params` fill a similar role, but are not the same.
+///
+/// `forbid_params_after` is only respected if an anon const is *not* created, that is, we directly resolve to a const param.
+/// `allow_anon_const_using_generic_params` is only respected if an anon const *is* created.
+///
+/// For example, inside types, you are allowed to refer to const params in bare paths (but might be forbidden from referring
+/// to *some*, in param defaults), but not allowed to do so in anon consts (e.g. `{ {}; N }` is forbidden, because it creates
+/// an anon const). Inside field defaults, you are allowed to refer to them even inside anon consts.
+///
+/// There's also `generic_const_exprs`, `min_generic_const_args`, and `generic_const_args`, all of which we don't implement yet.
 pub(crate) fn create_anon_const<'a, 'db>(
     interner: DbInterner<'db>,
     owner: ExpressionStoreOwnerId,
@@ -362,6 +348,7 @@ pub(crate) fn create_anon_const<'a, 'db>(
     create_var: Option<&mut dyn FnMut(Span) -> Const<'db>>,
     lowering_mode: LoweringMode,
     forbid_params_after: Option<u32>,
+    allow_anon_const_using_generic_params: bool,
 ) -> Result<Const<'db>, CreateConstError<'db>> {
     let mut expr = &store[expr_id];
     if let Expr::Block { statements, tail: Some(tail), .. } = expr
@@ -397,21 +384,20 @@ pub(crate) fn create_anon_const<'a, 'db>(
                 return Err(CreateConstError::AnonConstInterningDisabled);
             };
 
-            let allow_using_generic_params = forbid_params_after.is_none();
             let konst = AnonConstId::new(
                 interner.db,
                 AnonConstLoc {
                     owner,
                     expr: expr_id,
                     ty: StoredEarlyBinder::bind(expected_ty.store()),
-                    allow_using_generic_params,
+                    allow_using_generic_params: allow_anon_const_using_generic_params,
                 },
                 token,
             );
-            let args = if allow_using_generic_params {
+            let args = if allow_anon_const_using_generic_params {
                 GenericArgs::identity_for_item(interner, owner.generic_def(interner.db).into())
             } else {
-                GenericArgs::empty(interner)
+                GenericArgs::empty()
             };
             Ok(Const::new_unevaluated(
                 interner,
@@ -426,7 +412,6 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db dyn HirDatabase,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
-    let interner = DbInterner::new_no_crate(db);
     let def = variant_id.into();
     let body = Body::of(db, def);
     let loc = variant_id.lookup(db);
@@ -446,7 +431,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
 
     let mir_body = db.monomorphized_mir_body(
         def.into(),
-        GenericArgs::empty(interner).store(),
+        GenericArgs::empty().store(),
         ParamEnvAndCrate {
             param_env: db.trait_environment(def.generic_def(db)),
             krate: def.krate(db),
@@ -561,10 +546,9 @@ pub(crate) fn const_eval_static<'db>(
         db: &'db dyn HirDatabase,
         def: StaticId,
     ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let interner = DbInterner::new_no_crate(db);
         let body = db.monomorphized_mir_body(
             def.into(),
-            GenericArgs::empty(interner).store(),
+            GenericArgs::empty().store(),
             ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
                 .store(),
         )?;

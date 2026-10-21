@@ -3,12 +3,12 @@ use std::{fmt, iter};
 
 use itertools::Itertools;
 use rustc_ast as ast;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::thin_vec::ThinVec;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, a_or_an, listify, pluralize};
 use rustc_hir as hir;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
@@ -17,16 +17,16 @@ use rustc_hir_analysis::check::potentially_plural_count;
 use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, ResolvedStructPath};
 use rustc_index::IndexVec;
 use rustc_infer::infer::{
-    BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace, relate,
+    BoundRegionConversionTime, DefineOpaqueTypes, InferCtxt, InferOk, TypeTrace, relate,
 };
+use rustc_infer::traits::WellFormedLoc;
 use rustc_middle::ty::adjustment::AllowTwoPhase;
-use rustc_middle::ty::error::{ExpectedFound, TypeError};
+use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
 use rustc_middle::ty::relate::{Relate, RelateResult, TypeRelation};
 use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
-use rustc_middle::{bug, span_bug};
 use rustc_session::Session;
-use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, bug, kw, span_bug, sym};
 use rustc_trait_selection::error_reporting::infer::{FailureCode, ObligationCauseExt};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt, SelectionContext};
@@ -37,7 +37,7 @@ use crate::Expectation::*;
 use crate::TupleArgumentsFlag::*;
 use crate::callee::SplatLoweringInfo;
 use crate::coercion::CoerceMany;
-use crate::diagnostics::{ExprParenthesesNeeded, SuggestPtrNullMut};
+use crate::diagnostics::{ExprParenthesesNeeded, SuggestPtrNullMut, SuggestRawMut, SuggestRefMut};
 use crate::fn_ctxt::arg_matrix::{ArgMatrix, Compatibility, Error, ExpectedIdx, ProvidedIdx};
 use crate::gather_locals::Declaration;
 use crate::inline_asm::InlineAsmCtxt;
@@ -102,8 +102,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     hir::ExprKind::ConstBlock(..) => return None,
                     hir::ExprKind::Path(qpath) => {
                         let res = self.typeck_results.borrow().qpath_res(qpath, element.hir_id);
-                        if let Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _) = res
-                        {
+                        if let Res::Def(DefKind::Const | DefKind::AssocConst, _) = res {
                             return None;
                         }
                     }
@@ -232,7 +231,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.register_wf_obligation(
                 fn_input_ty.into(),
                 arg_expr.span,
-                ObligationCauseCode::WellFormed(None),
+                ObligationCauseCode::WellFormed(WellFormedLoc::HirId(arg_expr.hir_id)),
             );
 
             self.check_place_expr_if_unsized(fn_input_ty, arg_expr);
@@ -246,7 +245,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let mut expected_input_tys: Option<Vec<_>> = expectation
             .only_has_type(self)
             .and_then(|expected_output| {
-                let formal_output = self.resolve_vars_with_obligations(formal_output);
+                let formal_output =
+                    self.deeply_resolve_ignoring_regions_with_obligations(formal_output);
                 // FIXME(#149379): This operation results in expected input
                 // types which are potentially not well-formed or for whom the
                 // function where-bounds don't actually hold. This results
@@ -283,7 +283,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         Ok(Some(
                             formal_input_tys
                                 .iter()
-                                .map(|&ty| self.resolve_vars_if_possible(ty))
+                                .map(|&ty| self.deeply_resolve_ignoring_regions(ty))
                                 .collect::<Vec<_>>(),
                         ))
                     })
@@ -293,22 +293,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     expected_input_tys
                         .into_iter()
                         .zip(formal_input_tys)
-                        // if the expected input type is structurally equal to the formal input type,
-                        // i.e. we've only changed some inference variables around, keep the formal
-                        // input ty as the expected input ty. Usually fudging helps because it gains
-                        // information from a callsite of a function. However, Fudging also sometimes
-                        // loses information, when the original, formal, input type had constraints on it,
-                        // and fudging replaces all inference variables with fresh ones, those constraints
-                        // are discarded. This check makes sure we only keep fudging output if structural
-                        // changes were made to the type. If all that was changed were some typevars,
-                        // we go back to the unfudged formal input type.
                         .map(|(expected_input_ty, formal_input_ty)| {
-                            if same_type_modulo_vars(tcx, expected_input_ty, *formal_input_ty) {
-                                // if they're the same, fall back to the formal input type
-                                *formal_input_ty
-                            } else {
-                                expected_input_ty
-                            }
+                            only_keep_structural_changes(
+                                &self.infcx,
+                                *formal_input_ty,
+                                expected_input_ty,
+                            )
                         })
                         .collect()
                 }))
@@ -387,7 +377,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // Cause selection errors caused by resolving a single argument to point at the
             // argument and not the call. This lets us customize the span pointed to in the
             // fulfillment error to be more accurate.
-            let coerced_ty = self.resolve_vars_with_obligations(coerced_ty);
+            let coerced_ty = self.deeply_resolve_ignoring_regions_with_obligations(coerced_ty);
 
             let coerce_error =
                 self.coerce(provided_arg, checked_ty, coerced_ty, AllowTwoPhase::Yes, None).err();
@@ -541,7 +531,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                     ty::FnDef(..) => {
                         let fn_ptr = Ty::new_fn_ptr(self.tcx, arg_ty.fn_sig(self.tcx));
-                        let fn_ptr = self.resolve_vars_if_possible(fn_ptr).to_string();
+                        let fn_ptr = self.deeply_resolve_ignoring_regions(fn_ptr).to_string();
 
                         let fn_item_spa = arg.span;
                         tcx.sess.dcx().emit_err(diagnostics::PassFnItemToVariadicFunction {
@@ -572,7 +562,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .iter()
                     .copied()
                     .zip_eq(expected_input_tys.iter().copied())
-                    .map(|vars| self.resolve_vars_if_possible(vars)),
+                    .map(|vars| self.deeply_resolve_ignoring_regions(vars)),
             );
 
             self.report_arg_errors(
@@ -652,7 +642,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let formal_input_tupled_ty = formal_input_tys[first_tupled_arg_index_usz];
         // Keep the type variable if the argument is splatted, so we can force it to be a tuple later.
         let tuple_type = if tuple_arguments.is_splatted() {
-            let callee_tuple_type = self.resolve_vars_with_obligations(formal_input_tupled_ty);
+            let callee_tuple_type =
+                self.deeply_resolve_ignoring_regions_with_obligations(formal_input_tupled_ty);
             if callee_tuple_type.is_ty_var()
                 && let Some(tupled_args_count) = tupled_args_count
             {
@@ -693,7 +684,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         must be a tuple or unit type: {:?}",
                         type_errors,
                     )
-                    .emit();
+                    .emit_err();
                     Ty::new_error(self.tcx, guar)
                 }
             } else {
@@ -758,7 +749,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     "cannot use call notation; the first type parameter \
                     for the function trait is neither a tuple nor unit"
                 )
-                .emit();
+                .emit_err();
 
                 Some(guar)
             } else if tuple_arguments.is_splatted() {
@@ -789,7 +780,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         )
                         .kind(),
                     )
-                    .emit();
+                    .emit_err();
 
                     Some(guar)
                 } else if formal_input_tys.len() != provided_args.len() {
@@ -803,7 +794,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         provided_args.len(),
                         if provided_args.len() == 1 { "was" } else { "were" },
                     )
-                    .emit();
+                    .emit_err();
 
                     Some(guar)
                 } else {
@@ -825,7 +816,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // FIXME(const_trait_impl): does not enforce constness yet
                 self.write_splatted_call(
                     call_expr.hir_id,
-                    call_span,
                     fn_id,
                     callee_generic_args,
                     first_tupled_arg_index,
@@ -979,26 +969,65 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             );
         }
 
-        err.emit()
+        err.emit_err()
     }
 
-    fn suggest_ptr_null_mut(
+    fn suggest_mut_addr(
         &self,
         expected_ty: Ty<'tcx>,
         provided_ty: Ty<'tcx>,
         arg: &hir::Expr<'tcx>,
         err: &mut Diag<'_>,
     ) {
-        if let ty::RawPtr(_, hir::Mutability::Mut) = expected_ty.kind()
-            && let ty::RawPtr(_, hir::Mutability::Not) = provided_ty.kind()
-            && let hir::ExprKind::Call(callee, _) = arg.kind
-            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind
-            && let Res::Def(_, def_id) = path.res
-            && self.tcx.get_diagnostic_item(sym::ptr_null) == Some(def_id)
-        {
+        match (expected_ty.kind(), provided_ty.kind(), arg.kind) {
             // The user provided `ptr::null()`, but the function expects
             // `ptr::null_mut()`.
-            err.subdiagnostic(SuggestPtrNullMut { span: arg.span });
+            (
+                ty::RawPtr(_, hir::Mutability::Mut),
+                ty::RawPtr(_, hir::Mutability::Not),
+                hir::ExprKind::Call(callee, _),
+            ) if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind
+                && let Res::Def(_, def_id) = path.res
+                && self.tcx.get_diagnostic_item(sym::ptr_null) == Some(def_id) =>
+            {
+                err.subdiagnostic(SuggestPtrNullMut { span: arg.span });
+            }
+            // &mut T expected, &T or *const/mut T found
+            // suggestion: replace `&` or `&raw const/mut` with `&mut`
+            (
+                ty::Ref(_, expected_ty, hir::Mutability::Mut),
+                ty::Ref(_, provided_ty, hir::Mutability::Not),
+                hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Not, expr),
+            )
+            | (
+                ty::Ref(_, expected_ty, hir::Mutability::Mut),
+                ty::RawPtr(provided_ty, _),
+                hir::ExprKind::AddrOf(hir::BorrowKind::Raw, _, expr),
+            ) if expected_ty == provided_ty => {
+                let span = arg.span.until(expr.span);
+                err.subdiagnostic(SuggestRefMut { span });
+            }
+            // *mut T expected, *const T found
+            // suggestion: replace `&raw const` with `&raw mut`
+            (
+                ty::RawPtr(expected_ty, hir::Mutability::Mut),
+                ty::RawPtr(provided_ty, hir::Mutability::Not),
+                hir::ExprKind::AddrOf(hir::BorrowKind::Raw, hir::Mutability::Not, expr),
+            ) if expected_ty == provided_ty => {
+                let span = arg.span.until(expr.span);
+                err.subdiagnostic(SuggestRawMut { span });
+            }
+            // *mut T expected, &T found
+            // suggestion: replace `&` `&mut`
+            (
+                ty::RawPtr(expected_ty, hir::Mutability::Mut),
+                ty::Ref(_, provided_ty, hir::Mutability::Not),
+                hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Not, expr),
+            ) if expected_ty == provided_ty => {
+                let span = arg.span.until(expr.span);
+                err.subdiagnostic(SuggestRefMut { span });
+            }
+            _ => {}
         }
     }
 
@@ -1124,7 +1153,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty.normalized.sort_string(self.tcx)
                 )
                 .with_span_label(path_span, "not a struct")
-                .emit(),
+                .emit_err(),
             })
         }
     }
@@ -1198,7 +1227,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.register_wf_obligation(
                 decl_ty.into(),
                 decl.pat.span,
-                ObligationCauseCode::WellFormed(None),
+                ObligationCauseCode::WellFormed(WellFormedLoc::HirId(decl.pat.hir_id)),
             );
         }
         self.overwrite_local_ty_if_err(decl.hir_id, decl.pat, pat_ty);
@@ -1833,7 +1862,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 param.param.span(),
                                 format!(
                                     "this parameter needs to match the {} type of {deps_list}",
-                                    self.resolve_vars_if_possible(
+                                    self.deeply_resolve_ignoring_regions(
                                         formal_and_expected_inputs[param.deps[0]].1
                                     )
                                     .sort_string(self.tcx),
@@ -1857,7 +1886,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 format!(
                                     "{deps_list} need{} to match the {} type of this parameter",
                                     pluralize!((deps.len() != 1) as u32),
-                                    self.resolve_vars_if_possible(expected_ty)
+                                    self.deeply_resolve_ignoring_regions(expected_ty)
                                         .sort_string(self.tcx),
                                 ),
                             );
@@ -2036,7 +2065,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
 
                 let expected_display_type = self
-                    .resolve_vars_if_possible(formal_and_expected_inputs[idx].1)
+                    .deeply_resolve_ignoring_regions(formal_and_expected_inputs[idx].1)
                     .sort_string(self.tcx);
                 let label = if idxs_matched == params_with_generics.len() - 1 {
                     format!(
@@ -2108,25 +2137,32 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 None
             }
         });
-        match (body_id, params) {
+        let mut params_with_generics: IndexVec<ExpectedIdx, _> = match (body_id, params) {
             (Some(_), Some(_)) | (None, None) => unreachable!(),
             (Some(body), None) => {
                 let params = self.tcx.hir_body(body).params;
                 let params = params
                     .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
-                Some((fn_inputs.zip(params.iter().map(FnParam::Param)).collect(), generics))
+                fn_inputs.zip(params.iter().map(FnParam::Param)).collect()
             }
             (None, Some(params)) => {
                 let params = params
                     .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
-                Some((
-                    fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect(),
-                    generics,
-                ))
+                fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect()
+            }
+        };
+        for param in generics.params {
+            if let hir::GenericParamKind::Const { arg_pos: Some(pos), .. } = param.kind
+                && let Some(idx) = (pos as usize).checked_sub(is_method as usize)
+            {
+                params_with_generics
+                    .raw
+                    .insert(idx, (None, FnParam::Ident(Some(param.name.ident()))));
             }
         }
+        Some((params_with_generics, generics))
     }
 }
 
@@ -2364,7 +2400,7 @@ impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
                         self.tuple_arguments,
                     );
                     self.suggest_confusable(&mut err);
-                    Some(err.emit())
+                    Some(err.emit_err())
                 } else {
                     None
                 }
@@ -2385,7 +2421,7 @@ impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
                     span: self.call_metadata.error_span,
                 });
                 self.arg_matching_ctxt.suggest_confusable(&mut err);
-                return Some(err.emit());
+                return Some(err.emit_err());
             }
         }
 
@@ -2441,7 +2477,7 @@ impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
                     *e,
                 );
                 self.arg_matching_ctxt.suggest_confusable(&mut err);
-                reported = Some(err.emit());
+                reported = Some(err.emit_err());
                 return false;
             }
             true
@@ -2491,7 +2527,7 @@ impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
                 );
             }
 
-            self.suggest_ptr_null_mut(
+            self.suggest_mut_addr(
                 expected_ty,
                 provided_ty,
                 self.provided_args[provided_idx],
@@ -2523,7 +2559,7 @@ impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
             );
             self.arg_matching_ctxt.suggest_confusable(&mut err);
             self.detect_dotdot(&mut err, provided_ty, self.provided_args[provided_idx]);
-            return Some(err.emit());
+            return Some(err.emit_err());
         }
 
         None
@@ -3187,6 +3223,8 @@ impl<'a, 'tcx> ArgMatchingCtxt<'a, 'tcx> {
             );
             return;
         }
+
+        self.annotate_alternative_method_deref(err, self.call_expr, None);
     }
 
     /// A "softer" version of the `demand_compatible`, which checks types without persisting them,
@@ -3222,9 +3260,14 @@ impl<'a, 'tcx> ArgMatchingCtxt<'a, 'tcx> {
 
         // Using probe here, since we don't want this subtyping to affect inference.
         let subtyping_error = self.probe(|_| {
-            self.at(&self.misc(arg_span), self.param_env)
-                .sup(DefineOpaqueTypes::Yes, formal_input_ty, coerced_ty)
-                .err()
+            self.sup_raw(
+                &self.misc(arg_span),
+                self.param_env,
+                DefineOpaqueTypes::Yes,
+                formal_input_ty,
+                coerced_ty,
+            )
+            .err()
         });
 
         // Same as above: if either the coerce type or the checked type is an error type,
@@ -3310,7 +3353,7 @@ impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
         // Sometimes macros mess up the spans, so do not normalize the
         // arg span to equal the error span, because that's less useful
         // than pointing out the arg expr in the wrong context.
-        if normalized_span.source_equal(self.call_metadata.error_span) {
+        if normalized_span.lo_hi() == self.call_metadata.error_span.lo_hi() {
             span
         } else {
             normalized_span
@@ -3331,7 +3374,7 @@ impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
                     .expr_ty_adjusted_opt(expr)
                     .unwrap_or_else(|| Ty::new_misc_error(self.call_ctxt.fn_ctxt.tcx));
                 (
-                    self.call_ctxt.fn_ctxt.resolve_vars_if_possible(ty),
+                    self.call_ctxt.fn_ctxt.deeply_resolve_ignoring_regions(ty),
                     self.normalize_span(expr.span),
                 )
             })
@@ -3571,50 +3614,63 @@ enum SuggestionText {
     DidYouMean,
 }
 
-fn same_type_modulo_vars<'tcx>(tcx: TyCtxt<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> bool {
-    struct SameModuloVars<'tcx> {
-        tcx: TyCtxt<'tcx>,
+/// Postprocessing step of fudging: after fudging, any changes from the formal input type to the
+/// expected input type are only kept, if they result in structural changes. If the only change is
+/// one inference variable changing to another (fresh) inference variable, the formal one is kept,
+/// not the fresh one. This avoids cases in which those fresh inference variables are *less*
+/// constrained than the original formal ones, and making them fresh has no benefit.
+fn only_keep_structural_changes<'tcx>(
+    infcx: &InferCtxt<'tcx>,
+    formal: Ty<'tcx>,
+    expected: Ty<'tcx>,
+) -> Ty<'tcx> {
+    struct OnlyKeepStructuralChanges<'a, 'tcx> {
+        infcx: &'a InferCtxt<'tcx>,
     }
-    impl<'tcx> TypeRelation<TyCtxt<'tcx>> for SameModuloVars<'tcx> {
+    impl<'tcx> TypeRelation<TyCtxt<'tcx>> for OnlyKeepStructuralChanges<'_, 'tcx> {
         fn cx(&self) -> TyCtxt<'tcx> {
-            self.tcx
+            self.infcx.tcx
         }
 
         fn relate_ty_args(
             &mut self,
-            a_ty: Ty<'tcx>,
-            _b_ty: Ty<'tcx>,
-            _ty_def_id: DefId,
-            a_args: ty::GenericArgsRef<'tcx>,
-            b_args: ty::GenericArgsRef<'tcx>,
-            _mk: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+            formal_ty: Ty<'tcx>,
+            _expected_ty: Ty<'tcx>,
+            _def_id: DefId,
+            formal_args: ty::GenericArgsRef<'tcx>,
+            expected_args: ty::GenericArgsRef<'tcx>,
+            mk: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
         ) -> RelateResult<'tcx, Ty<'tcx>> {
-            relate::relate_args_invariantly(self, a_args, b_args)?;
-            Ok(a_ty)
+            let new_args = relate::relate_args_invariantly(self, formal_args, expected_args)?;
+
+            if new_args == formal_args { Ok(formal_ty) } else { Ok(mk(new_args)) }
         }
 
         fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
             &mut self,
             _variance: ty::Variance,
             _info: ty::VarianceDiagInfo<TyCtxt<'tcx>>,
-            a: T,
-            b: T,
+            formal: T,
+            expected: T,
         ) -> RelateResult<'tcx, T> {
-            self.relate(a, b)
+            self.relate(formal, expected)
         }
 
-        fn tys(&mut self, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
-            if a == b {
-                return Ok(a);
+        fn tys(&mut self, formal: Ty<'tcx>, expected: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
+            if formal == expected {
+                return Ok(formal);
             }
 
-            match (a.kind(), b.kind()) {
+            match (formal.kind(), expected.kind()) {
+                // If both are an infer var, keep the formal one.
                 (&ty::Infer(ty::InferTy::TyVar(_)), &ty::Infer(ty::InferTy::TyVar(_)))
                 | (&ty::Infer(ty::InferTy::FloatVar(_)), &ty::Infer(ty::InferTy::FloatVar(_)))
-                | (&ty::Infer(ty::InferTy::IntVar(_)), &ty::Infer(ty::InferTy::IntVar(_))) => Ok(a),
-                (&ty::Infer(_), _) | (_, &ty::Infer(_)) => Err(TypeError::Mismatch),
+                | (&ty::Infer(ty::InferTy::IntVar(_)), &ty::Infer(ty::InferTy::IntVar(_))) => {
+                    Ok(formal)
+                }
+                (&ty::Infer(_), _) | (_, &ty::Infer(_)) => Ok(expected),
                 (&ty::Error(guar), _) | (_, &ty::Error(guar)) => Ok(Ty::new_error(self.cx(), guar)),
-                _ => relate::structurally_relate_tys(self, a, b),
+                _ => relate::structurally_relate_tys(self, formal, expected),
             }
         }
 
@@ -3628,42 +3684,47 @@ fn same_type_modulo_vars<'tcx>(tcx: TyCtxt<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> b
 
         fn consts(
             &mut self,
-            mut a: ty::Const<'tcx>,
-            mut b: ty::Const<'tcx>,
+            mut formal: ty::Const<'tcx>,
+            mut expected: ty::Const<'tcx>,
         ) -> RelateResult<'tcx, ty::Const<'tcx>> {
-            if a == b {
-                return Ok(a);
+            if formal == expected {
+                return Ok(formal);
             }
 
             // Avoid ICEs when in gce, and `structurally_relate_consts`
             // turns a non-infer const into an infer const
-            if self.tcx.features().generic_const_exprs() {
-                a = self.tcx.expand_abstract_consts(a);
-                b = self.tcx.expand_abstract_consts(b);
+            if self.cx().features().generic_const_exprs() {
+                formal = self.cx().expand_abstract_consts(formal);
+                expected = self.cx().expand_abstract_consts(expected);
             }
 
-            match (a.kind(), b.kind()) {
-                (ty::ConstKind::Infer(_), ty::ConstKind::Infer(_)) => return Ok(a),
-                (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => {
-                    return Err(TypeError::ConstMismatch(ExpectedFound::new(a, b)));
-                }
+            match (formal.kind(), expected.kind()) {
+                // If both are an infer var, keep the formal one.
+                (ty::ConstKind::Infer(_), ty::ConstKind::Infer(_)) => return Ok(formal),
+                (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => return Ok(formal),
+
                 _ => {}
             }
 
-            relate::structurally_relate_consts(self, a, b)
+            relate::structurally_relate_consts(self, formal, expected)
         }
 
         fn binders<T>(
             &mut self,
-            a: ty::Binder<'tcx, T>,
-            b: ty::Binder<'tcx, T>,
+            formal: ty::Binder<'tcx, T>,
+            expected: ty::Binder<'tcx, T>,
         ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
         where
             T: Relate<TyCtxt<'tcx>>,
         {
-            Ok(a.rebind(self.relate(a.skip_binder(), b.skip_binder())?))
+            Ok(formal.rebind(self.relate(formal.skip_binder(), expected.skip_binder())?))
         }
     }
 
-    SameModuloVars { tcx }.relate(a, b).is_ok()
+    // If it errors for some reason, keep the expected type, not the formal one, keeping the fudging.
+    let res = OnlyKeepStructuralChanges { infcx }.relate(formal, expected).unwrap_or(expected);
+    tracing::debug!(
+        "formal: {formal:?} and expected {expected:?} => only keeping structural changes creates {res:?}"
+    );
+    res
 }

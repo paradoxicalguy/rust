@@ -2,6 +2,7 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use rustc_data_structures::fx::FxIndexSet;
+use rustc_span::RemapPathScopeComponents;
 use rustc_span::edition::Edition;
 
 use crate::doctest::{
@@ -14,6 +15,7 @@ use crate::html::markdown::{Ignore, LangString};
 pub(crate) struct DocTestRunner {
     crate_attrs: FxIndexSet<String>,
     global_crate_attrs: FxIndexSet<String>,
+    /// A comma-separated list of references to test descriptors.
     ids: String,
     output: String,
     output_merged_tests: String,
@@ -54,7 +56,7 @@ impl DocTestRunner {
             }
         }
         self.ids.push_str(&format!(
-            "tests.push({}::TEST);\n",
+            "&{}::TEST,\n",
             generate_mergeable_doctest(
                 doctest,
                 scraped_test,
@@ -166,18 +168,14 @@ mod __doctest_mod {{
 
 #[rustc_main]
 fn main() -> std::process::ExitCode {{
-let tests = {{
-    let mut tests = Vec::with_capacity({nb_tests});
-    {ids}
-    tests
-}};
+let tests = &[{ids}];
 let test_args = &[{test_args}];
 const ENV_BIN: &'static str = \"RUSTDOC_DOCTEST_BIN_PATH\";
 
 if let Ok(binary) = std::env::var(ENV_BIN) {{
     let _ = crate::__doctest_mod::BINARY_PATH.set(binary.into());
     unsafe {{ std::env::remove_var(ENV_BIN); }}
-    return std::process::Termination::report(test::test_main(test_args, tests, None));
+    return test::test_main(test_args, tests);
 }} else if let Ok(nb_test) = std::env::var(__doctest_mod::RUN_OPTION) {{
     if let Ok(nb_test) = nb_test.parse::<usize>() {{
         if let Some(test) = tests.get(nb_test) {{
@@ -191,9 +189,8 @@ if let Ok(binary) = std::env::var(ENV_BIN) {{
 
 eprintln!(\"WARNING: No rustdoc doctest environment variable provided so doctests will be run in \
 the same process\");
-std::process::Termination::report(test::test_main(test_args, tests, None))
+test::test_main(test_args, tests)
 }}",
-            nb_tests = self.nb_tests,
             output = self.output_merged_tests,
             ids = self.ids,
         )
@@ -202,7 +199,7 @@ std::process::Termination::report(test::test_main(test_args, tests, None))
             full_test_code: format!("{code_prefix}{code}", code = self.output),
             full_test_line_offset: 0,
             test_opts: test_options,
-            global_opts: opts.clone(),
+            global_opts: opts,
             langstr: LangString::default(),
             line: 0,
             edition,
@@ -261,14 +258,14 @@ fn main() {returns_result} {{
         output_merged_tests,
         "
 mod {test_id} {{
-pub const TEST: test::TestDescAndFn = test::TestDescAndFn::new_doctest(
+pub static TEST: test::TestDescAndFn = test::TestDescAndFn::new_doctest(
 {test_name:?}, {ignore}, {file:?}, {line}, {no_run}, {should_panic},
 test::StaticTestFn(
     || {{{runner}}},
 ));
 }}",
         test_name = scraped_test.name,
-        file = scraped_test.path(),
+        file = scraped_test.path(RemapPathScopeComponents::MACRO),
         line = scraped_test.line,
         no_run = scraped_test.langstr.no_run,
         should_panic = !scraped_test.langstr.no_run && scraped_test.langstr.should_panic,

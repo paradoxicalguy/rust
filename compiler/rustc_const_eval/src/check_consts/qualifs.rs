@@ -5,12 +5,13 @@
 // FIXME(const_trait_impl): This API should be really reworked. It's dangerously general for
 // having basically only two use-cases that act in different ways.
 
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::mir;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, AdtDef, Ty, TypingMode};
-use rustc_middle::{bug, mir};
+use rustc_span::bug;
 use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use tracing::instrument;
 
@@ -40,6 +41,11 @@ pub fn in_any_value_of_ty<'tcx>(
 /// To accomplish this, const-checking and promotion use a value-based analysis (as opposed to a
 /// type-based one). Qualifications propagate structurally across variables: If a local (or a
 /// projection of a local) is assigned a qualified value, that local itself becomes qualified.
+///
+/// Note that whenever this analysis relies on something being UB and hence impossible in
+/// well-defined code, it is crucial that const-eval actually detects that UB! Const-eval is not
+/// guaranteed to detect all UB, and if it would skip this particular UB we may end up executing
+/// code that has not been const-checked.
 pub trait Qualif {
     /// The name of the file used to debug the dataflow analysis that computes this qualif.
     const ANALYSIS_NAME: &'static str;

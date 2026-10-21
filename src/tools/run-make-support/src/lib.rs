@@ -22,6 +22,7 @@ pub mod scoped_run;
 pub mod string;
 pub mod symbols;
 pub mod targets;
+pub mod wasm;
 
 // Internally we call our fs-related support module as `fs`, but re-export its content as `rfs`
 // to tests to avoid colliding with commonly used `use std::fs;`.
@@ -79,7 +80,9 @@ pub use crate::external_deps::llvm::{
     llvm_readobj,
 };
 pub use crate::external_deps::python::python_command;
-pub use crate::external_deps::rustc::{self, Rustc, bare_rustc, rustc, rustc_minicore, rustc_path};
+pub use crate::external_deps::rustc::{
+    self, Rustc, bare_rustc, rustc, rustc_minicore, rustc_path, stable_bare_rustc,
+};
 pub use crate::external_deps::rustdoc::{Rustdoc, bare_rustdoc, rustdoc};
 // Path-related helpers.
 pub use crate::path_helpers::{

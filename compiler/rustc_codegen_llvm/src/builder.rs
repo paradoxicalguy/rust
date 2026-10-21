@@ -8,13 +8,13 @@ pub(crate) mod gpu_offload;
 
 use libc::{c_char, c_uint};
 use rustc_abi::{self as abi, Align, CanonAbi, Size, WrappingRange};
+use rustc_attr_ir::UnrollAttr;
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::{IntPredicate, RealPredicate, SynchronizationScope, TypeKind};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::small_c_str::SmallCStr;
-use rustc_hir::attrs::{AttributeKind, UnrollAttr};
 use rustc_hir::def_id::DefId;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::{
@@ -24,7 +24,7 @@ use rustc_middle::ty::layout::{
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_sanitizers::{cfi, kcfi};
 use rustc_session::config::OptLevel;
-use rustc_span::Span;
+use rustc_span::{Span, bug};
 use rustc_target::callconv::{FnAbi, PassMode};
 use rustc_target::spec::{Arch, HasTargetSpec, SanitizerSet, Target};
 use smallvec::SmallVec;
@@ -340,16 +340,13 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         }
     }
 
-    fn br_with_attrs(&mut self, dest: &'ll BasicBlock, attributes: &[AttributeKind]) {
+    fn br_with_attrs(&mut self, dest: &'ll BasicBlock, loop_hint_attrs: &[UnrollAttr]) {
         unsafe {
             let val = llvm::LLVMBuildBr(self.llbuilder, dest);
 
             let mut nodes = Vec::new();
 
-            for attribute in attributes {
-                let AttributeKind::Unroll(unroll) = attribute else {
-                    continue;
-                };
+            for unroll in loop_hint_attrs {
                 // UnrollAttr::Count needs a second operand, the provided count, but the other
                 // unroll hints do not.
                 let md_node = if let UnrollAttr::Count(count) = unroll {
@@ -454,15 +451,25 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
+        return_slot: ReturnSlot<&'ll Value>,
         args: &[&'ll Value],
         then: &'ll BasicBlock,
         catch: &'ll BasicBlock,
         funclet: Option<&Funclet<'ll>>,
         instance: Option<Instance<'tcx>>,
     ) -> &'ll Value {
+        // If this function returns indirectly (`PassMode::Indirect`),
+        // the `return_slot` should be the first argument.
+        let args = match return_slot {
+            ReturnSlot::Direct => args.to_vec(),
+            ReturnSlot::Indirect(sret_ptr) => {
+                let mut args = args.to_vec();
+                args.insert(0, sret_ptr);
+                args
+            }
+        };
         debug!("invoke {:?} with args ({:?})", llfn, args);
-
-        let args = self.check_call("invoke", llty, llfn, args);
+        let args = self.check_call("invoke", llty, llfn, &args);
         let funclet_bundle = funclet.map(|funclet| funclet.bundle());
         let mut bundles: SmallVec<[_; 2]> = SmallVec::new();
         if let Some(funclet_bundle) = funclet_bundle {
@@ -909,9 +916,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                     self.set_metadata_node(store, llvm::MD_nontemporal, &[one]);
                 }
             }
-            if flags.contains(MemFlags::CAPTURES_READ_ONLY)
-                && crate::llvm_util::get_version() >= (22, 0, 0)
-            {
+            if flags.contains(MemFlags::CAPTURES_READ_ONLY) {
                 assert!(
                     self.type_kind(self.val_ty(val)) == TypeKind::Pointer,
                     "CAPTURED_READ_ONLY is only supported on pointer stores"
@@ -1463,13 +1468,23 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
+        return_slot: ReturnSlot<&'ll Value>,
         args: &[&'ll Value],
         funclet: Option<&Funclet<'ll>>,
         callee_instance: Option<Instance<'tcx>>,
     ) -> &'ll Value {
+        // If this function returns indirectly (`PassMode::Indirect`),
+        // the `return_slot` should be the first argument.
+        let args = match return_slot {
+            ReturnSlot::Direct => args.to_vec(),
+            ReturnSlot::Indirect(sret_ptr) => {
+                let mut args = args.to_vec();
+                args.insert(0, sret_ptr);
+                args
+            }
+        };
         debug!("call {:?} with args ({:?})", llfn, args);
-
-        let args = self.check_call("call", llty, llfn, args);
+        let args = self.check_call("call", llty, llfn, &args);
         let funclet_bundle = funclet.map(|funclet| funclet.bundle());
         let mut bundles: SmallVec<[_; 2]> = SmallVec::new();
         if let Some(funclet_bundle) = funclet_bundle {
@@ -1503,21 +1518,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
             )
         };
 
-        if let Some(callee_instance) = callee_instance {
-            // Attributes on the function definition being called
-            let callee_attrs = self.cx.tcx.codegen_fn_attrs(callee_instance.def_id());
-
-            if let Some(inlining_rule) =
-                attributes::inline_attr(&self.cx, self.cx.tcx, callee_instance, callee_attrs)
-            {
-                attributes::apply_to_callsite(
-                    call,
-                    llvm::AttributePlace::Function,
-                    &[inlining_rule],
-                );
-            }
-        }
-
         if let Some(fn_abi) = fn_abi {
             fn_abi.apply_attrs_callsite(self, call);
         }
@@ -1530,17 +1530,27 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Value,
+        return_slot: ReturnSlot<Self::Value>,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
         callee_instance: Option<Instance<'tcx>>,
     ) {
-        let call =
-            self.call(llty, caller_attrs, Some(fn_abi), llfn, args, funclet, callee_instance);
+        let call = self.call(
+            llty,
+            caller_attrs,
+            Some(fn_abi),
+            llfn,
+            return_slot,
+            args,
+            funclet,
+            callee_instance,
+        );
         llvm::LLVMSetTailCallKind(call, llvm::TailCallKind::MustTail);
 
         match &fn_abi.ret.mode {
             PassMode::Ignore | PassMode::Indirect { .. } => self.ret_void(),
             PassMode::Direct(_) | PassMode::Pair { .. } | PassMode::Cast { .. } => self.ret(call),
+            PassMode::IndirectUnsized { .. } => bug!("unsized returns are not supported"),
         }
     }
 
@@ -1875,7 +1885,8 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         args: &[&'ll Value],
     ) -> &'ll Value {
         let (ty, f) = self.cx.get_intrinsic(base_name.into(), type_params);
-        self.call(ty, None, None, f, args, None, None)
+        // No LLVM intrinsic returns its data indirectly (via `sret`).
+        self.call(ty, None, None, f, ReturnSlot::Direct, args, None, None)
     }
 
     fn call_lifetime_intrinsic(&mut self, intrinsic: &'static str, ptr: &'ll Value, size: Size) {
@@ -1888,14 +1899,10 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             return;
         }
 
-        if crate::llvm_util::get_version() >= (22, 0, 0) {
-            // LLVM 22 requires the lifetime intrinsic to act directly on the alloca,
-            // there can't be an addrspacecast in between.
-            let ptr = unsafe { llvm::LLVMRustStripPointerCasts(ptr) };
-            self.call_intrinsic(intrinsic, &[self.val_ty(ptr)], &[ptr]);
-        } else {
-            self.call_intrinsic(intrinsic, &[self.val_ty(ptr)], &[self.cx.const_u64(size), ptr]);
-        }
+        // LLVM 22 requires the lifetime intrinsic to act directly on the alloca,
+        // there can't be an addrspacecast in between.
+        let ptr = unsafe { llvm::LLVMRustStripPointerCasts(ptr) };
+        self.call_intrinsic(intrinsic, &[self.val_ty(ptr)], &[ptr]);
     }
 }
 impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
@@ -2050,17 +2057,24 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             let is_diag = self.tcx.sess.opts.unstable_opts.sanitizer_cfi_diag.unwrap_or(false);
             let is_recover =
                 self.tcx.sess.opts.unstable_opts.sanitizer_cfi_recover.unwrap_or(false);
+            let is_minimal =
+                self.tcx.sess.opts.unstable_opts.sanitizer_cfi_minimal_runtime.unwrap_or(false);
 
             if is_diag || is_recover {
-                let fty = self.cx.type_func(
-                    &[self.cx.type_ptr(), self.cx.type_isize(), self.cx.type_isize()],
-                    self.cx.type_void(),
-                );
+                let fty = if is_minimal {
+                    self.cx.type_func(&[], self.cx.type_void())
+                } else {
+                    self.cx.type_func(
+                        &[self.cx.type_ptr(), self.cx.type_isize(), self.cx.type_isize()],
+                        self.cx.type_void(),
+                    )
+                };
                 let ubsan_handler = self.declare_cfn(
-                    if is_recover {
-                        "__ubsan_handle_cfi_check_fail"
-                    } else {
-                        "__ubsan_handle_cfi_check_fail_abort"
+                    match (is_minimal, is_recover) {
+                        (true, true) => "__ubsan_handle_cfi_check_fail_minimal",
+                        (true, false) => "__ubsan_handle_cfi_check_fail_minimal_abort",
+                        (false, true) => "__ubsan_handle_cfi_check_fail",
+                        (false, false) => "__ubsan_handle_cfi_check_fail_abort",
                     },
                     llvm::UnnamedAddr::Global,
                     fty,
@@ -2086,12 +2100,18 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
                     self.generate_ubsan_cfi_diag_data(self.span, expected_ty, check_kind);
 
                 let function_address = self.ptrtoint(llfn, self.cx.type_isize());
+                let arguments: &[_] = if is_minimal {
+                    &[]
+                } else {
+                    &[diag_data, function_address, self.const_usize(0)]
+                };
                 self.call(
                     fty,
                     None,
                     None,
                     ubsan_handler,
-                    &[diag_data, function_address, self.const_usize(0)],
+                    ReturnSlot::Direct,
+                    arguments,
                     None,
                     None,
                 );
@@ -2101,7 +2121,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
                     self.unreachable();
                 }
             } else {
-                self.abort();
+                self.abort_immediate();
                 self.unreachable();
             }
 
@@ -2165,9 +2185,8 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         llfn: &'ll Value,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
     ) -> Option<llvm::OperandBundleBox<'ll>> {
-        if self.sess().pointer_authentication_functions().is_none() {
-            return None;
-        }
+        let schema = self.sess().pointer_authentication_functions()?;
+
         // Pointer authentication support is currently limited to extern "C" calls; filter out other
         // ABIs.
         if fn_abi?.conv != CanonAbi::C {
@@ -2185,11 +2204,12 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         // bundles.
         // Once this is resolved, we should analyze each call and skip direct calls. See the
         // discussion in the rust-lang issue: <https://github.com/rust-lang/rust/issues/152532>
-        let key: u32 = 0;
-        let discriminator: u64 = 0;
         Some(llvm::OperandBundleBox::new(
             "ptrauth",
-            &[self.const_u32(key), self.const_u64(discriminator)],
+            &[
+                self.const_u32(schema.key as u32),
+                self.const_u64(schema.constant_discriminator as u64),
+            ],
         ))
     }
 

@@ -6,11 +6,11 @@ export RUST_BACKTRACE="${RUST_BACKTRACE:-full}"
 export NEXTEST_STATUS_LEVEL=all
 
 target="${1:-}"
+host_tuple="$(rustc --print host-tuple)"
 
 if [ -z "$target" ]; then
-    host_target=$(rustc -vV | awk '/^host/ { print $2 }')
-    echo "Defaulted to host target $host_target"
-    target="$host_target"
+    echo "Defaulted to host target $host_tuple"
+    target="$host_tuple"
 fi
 
 # Print machine information
@@ -58,6 +58,9 @@ fi
 if [ "${BUILD_ONLY:-}" = "1" ]; then
     echo "no tests to run for build-only targets"
 else
+    # Get a quick performance score
+    cargo run -p sysbench --target "$target" --release
+
     test_builtins=(
         "${test_runner[@]}"
         --package builtins-test
@@ -138,7 +141,7 @@ echo "::endgroup"
 # Test libm
 
 # Make sure a simple build works
-cargo check -p libm --no-default-features --target "$target"
+asgroup cargo check -p libm --no-default-features --target "$target"
 
 if [ "${MAY_SKIP_LIBM_CI:-}" = "true" ]; then
     echo "skipping libm PR CI"
@@ -160,31 +163,32 @@ mflags+=(--exclude update-api-list)
 # We need to specifically skip tests for musl-math-sys on systems that can't
 # build musl since otherwise `--all` will activate it.
 case "$target" in
-    # Can't build at all on MSVC, WASM, or thumb
+    # Musl uses `__attribute__` a lot which MSVC doesn't support
     *windows-msvc*) mflags+=(--exclude musl-math-sys) ;;
+    # Possible with a patch for `a_clz_64`, but this is a build-only target so
+    # we don't have a C toolchain set up.
     *wasm*) mflags+=(--exclude musl-math-sys) ;;
-    *thumb*) mflags+=(--exclude musl-math-sys) ;;
-
-    # We can build musl on MinGW but running tests gets a stack overflow
+    # We can build musl but musl's results are inaccurate for unclear reasons.
     *windows-gnu*) ;;
-
     # Everything else gets musl enabled
     *) mflags+=(--features libm-test/build-musl) ;;
 esac
 
-
 # Configure which targets test against MPFR
 case "$target" in
-    # MSVC cannot link MPFR
+    # Excluded in gmp-mpfr-sys with "Windows MSVC target is not supported (linking
+    # would fail)". MPFR isn't really built for non-gcc-like compilers anyway.
     *windows-msvc*) ;;
     # FIXME: MinGW should be able to build MPFR, but setup in CI is nontrivial.
     *windows-gnu*) ;;
-    # Targets that aren't cross compiled in CI work fine
+    # Ensure enabled on targets that we expect to be native in CI
     aarch64*apple*) mflags+=(--features libm-test/build-mpfr) ;;
     aarch64*linux*) mflags+=(--features libm-test/build-mpfr) ;;
     i586*) mflags+=(--features libm-test/build-mpfr --features gmp-mpfr-sys/force-cross) ;;
     i686*) mflags+=(--features libm-test/build-mpfr) ;;
     x86_64*) mflags+=(--features libm-test/build-mpfr) ;;
+    # Fallback to enabled on native targets, disabled otherwise
+    *) [ "$target" = "$host_tuple" ] && mflags+=(--features libm-test/build-mpfr) ;;
 esac
 
 # FIXME: `STATUS_DLL_NOT_FOUND` testing macros on CI.

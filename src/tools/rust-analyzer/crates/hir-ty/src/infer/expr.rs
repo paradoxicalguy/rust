@@ -192,7 +192,6 @@ impl<'db> InferenceContext<'db> {
             | Pat::Lit(_)
             | Pat::Range { .. }
             | Pat::Slice { .. }
-            | Pat::ConstBlock(_)
             | Pat::Record { .. }
             | Pat::NotNull
             | Pat::Missing => true,
@@ -1310,7 +1309,7 @@ impl<'db> InferenceContext<'db> {
         expr: ExprId,
     ) -> Ty<'db> {
         let interner = self.interner();
-        let count_ct = self.create_anon_const(count, self.types.types.usize, true);
+        let count_ct = self.create_anon_const(count, self.types.types.usize);
         let count = self.table.try_structurally_resolve_const(count.into(), count_ct);
 
         let uty = match expected {
@@ -1486,8 +1485,7 @@ impl<'db> InferenceContext<'db> {
                                 PatOrigin::LetStmt { has_else: else_branch.is_some() },
                             );
                             if let Some(expr) = else_branch {
-                                let previous_diverges =
-                                    mem::replace(&mut this.diverges, Diverges::Maybe);
+                                let previous_diverges = this.diverges;
                                 this.infer_expr_coerce(
                                     *expr,
                                     &Expectation::HasType(this.types.types.never),

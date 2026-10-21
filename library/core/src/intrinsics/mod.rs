@@ -10,6 +10,30 @@
 //! and <https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_codegen_llvm/src/intrinsic.rs>,
 //! and for const evaluation in <https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_const_eval/src/interpret/intrinsics.rs>.
 //!
+//! Intrinsics don't need a body. However, they optionally can have a body, which we call the
+//! "fallback body". This will be used by codegen backends that do not have a dedicated
+//! implementation of the intrinsic, making it easier to add new intrinsics for specific operations
+//! without having to implement them in each codegen backend. The fallback body obviously has to be
+//! a valid implementation of the documented specification of the intrinsic. In some cases, the
+//! fallback body will be *equivalent* to the specification. Note that this is a strong requirement:
+//! if the spec says "UB if input `x` is even", then a valid implementation can just ignore this and
+//! do whatever it wants in that case; an *equivalent* implementation needs to actually check this
+//! condition and trigger UB in that case (e.g. by using `hint::assert_unchecked()`). Similar, if
+//! the spec says "returns `x` or `y` non-deterministically", then an *equivalent* implementation
+//! must actually do non-deterministic choice and return either value (e.g. by invoking some other
+//! language operation that has the same non-determinism). Intrinsics with such a fallback body that
+//! is equivalent to the spec may be marked with `#[miri::intrinsic_fallback_is_spec]`; the fallback
+//! body will then also be used by Miri for UB checking. When in doubt, do not use this attribute or
+//! ask the Miri maintainers for advice.
+//!
+//! Intrinsics are, in general, language extensions. Therefore, t-lang should be involved whenever a
+//! new intrinsic is exposed to stable code. However, if an intrinsic is marked
+//! `#[miri::intrinsic_fallback_is_spec]` with a fallback body that only uses stable features (or if
+//! such a fallback body could be written, but for one reason or another the actual fallback body is
+//! different), and if it also does not make other promises that go beyond observable program
+//! behavior (such as steering the optimizer in a particular direction), then an intrinsic may be
+//! used without t-lang involvement.
+//!
 //! # Const intrinsics
 //!
 //! In order to make an intrinsic unstable usable at compile-time, copy the implementation from
@@ -19,9 +43,10 @@
 //! wg-const-eval.
 //!
 //! If an intrinsic is supposed to be used from a `const fn` with a `rustc_const_stable` attribute,
-//! `#[rustc_intrinsic_const_stable_indirect]` needs to be added to the intrinsic. Such a change requires
-//! T-lang approval, because it may bake a feature into the language that cannot be replicated in
-//! user code without compiler support.
+//! `#[rustc_intrinsic_const_stable_indirect]` needs to be added to the intrinsic. Such a change
+//! requires T-lang approval, because it may bake a feature into the language that cannot be
+//! replicated in user code without compiler support. The same exception as above applies for
+//! `#[miri::intrinsic_fallback_is_spec]` intrinsics.
 //!
 //! # Volatiles
 //!
@@ -63,6 +88,7 @@ pub mod fallback;
 pub mod gpu;
 mod macros;
 pub mod mir;
+pub mod reflection;
 pub mod simd;
 
 use macros::intrinsic_dispatch_on_type;
@@ -70,7 +96,9 @@ use macros::intrinsic_dispatch_on_type;
 // These imports are used for simplifying intra-doc links
 #[allow(unused_imports)]
 #[cfg(all(target_has_atomic = "8", target_has_atomic = "32", target_has_atomic = "ptr"))]
-use crate::sync::atomic::{self, AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
+use crate::sync::atomic::{
+    self, AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, Ordering,
+};
 
 /// A type for atomic ordering parameters for intrinsics. This is a separate type from
 /// `atomic::Ordering` so that we can make it `ConstParamTy` and fix the values used here without a
@@ -90,12 +118,28 @@ pub enum AtomicOrdering {
 // N.B., these intrinsics take raw pointers because they mutate aliased
 // memory, which is not valid for either `&` or `&mut`.
 
-/// Stores a value if the current value is the same as the `old` value.
+/// Stores a value if the current value is the same as the `old` value,
+/// with the returned `T` being the previous value and the returned `bool` being
+/// whether the exchange was successful.
 /// `T` must be an integer or pointer type.
+///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::compare_exchange`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::compare_exchange`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
 ///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `compare_exchange` method.
 /// For example, [`AtomicBool::compare_exchange`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::compare_exchange`]: AtomicI32::compare_exchange
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::compare_exchange`]: AtomicPtr::compare_exchange
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_cxchg<
@@ -108,12 +152,28 @@ pub const unsafe fn atomic_cxchg<
     src: T,
 ) -> (T, bool);
 
-/// Stores a value if the current value is the same as the `old` value.
+/// Stores a value if the current value is the same as the `old` value,
+/// with the returned `T` being the previous value and the returned `bool` being
+/// whether the exchange was successful.
 /// `T` must be an integer or pointer type. The comparison may spuriously fail.
+///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::compare_exchange_weak`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::compare_exchange_weak`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
 ///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `compare_exchange_weak` method.
 /// For example, [`AtomicBool::compare_exchange_weak`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::compare_exchange_weak`]: AtomicI32::compare_exchange_weak
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::compare_exchange_weak`]: AtomicPtr::compare_exchange_weak
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_cxchgweak<
@@ -129,8 +189,20 @@ pub const unsafe fn atomic_cxchgweak<
 /// Loads the current value of the pointer.
 /// `T` must be an integer or pointer type.
 ///
+/// # Safety
+///
+/// * If `VOLATILE` is `true`, this is equivalent to [`Atomic<T>::load_volatile`].
+///   Refer to the documentation of that method for safety requirements.
+///
+/// * If `VOLATILE` is `false`, this is equivalent to [`Atomic<T>::from_ptr`] followed
+///   by [`Atomic<T>::load`]. Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `load` method. For example, [`AtomicBool::load`].
+///
+/// [`Atomic<T>::load_volatile`]: AtomicI32::load_volatile
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::load`]: AtomicI32::load
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_load<T: Copy, const ORD: AtomicOrdering, const VOLATILE: bool>(
@@ -140,8 +212,20 @@ pub const unsafe fn atomic_load<T: Copy, const ORD: AtomicOrdering, const VOLATI
 /// Stores the value at the specified memory location.
 /// `T` must be an integer or pointer type.
 ///
+/// # Safety
+///
+/// * If `VOLATILE` is `true`, this is equivalent to [`Atomic<T>::store_volatile`].
+///   Refer to the documentation of that method for safety requirements.
+///
+/// * If `VOLATILE` is `false`, this is equivalent to [`Atomic<T>::from_ptr`] followed
+///   by [`Atomic<T>::store`]. Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `store` method. For example, [`AtomicBool::store`].
+///
+/// [`Atomic<T>::store_volatile`]: AtomicI32::store_volatile
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::store`]: AtomicI32::store
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_store<T: Copy, const ORD: AtomicOrdering, const VOLATILE: bool>(
@@ -152,8 +236,22 @@ pub const unsafe fn atomic_store<T: Copy, const ORD: AtomicOrdering, const VOLAT
 /// Stores the value at the specified memory location, returning the old value.
 /// `T` must be an integer or pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::swap`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::swap`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `swap` method. For example, [`AtomicBool::swap`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::swap`]: AtomicI32::swap
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::swap`]: AtomicPtr::swap
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_xchg<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
@@ -162,8 +260,22 @@ pub const unsafe fn atomic_xchg<T: Copy, const ORD: AtomicOrdering>(dst: *mut T,
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_add`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::fetch_byte_add`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `fetch_add` method. For example, [`AtomicIsize::fetch_add`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_add`]: AtomicI32::fetch_add
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::fetch_byte_add`]: AtomicPtr::fetch_byte_add
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_xadd<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -175,8 +287,22 @@ pub const unsafe fn atomic_xadd<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_sub`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::fetch_byte_sub`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `fetch_sub` method. For example, [`AtomicIsize::fetch_sub`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_sub`]: AtomicI32::fetch_sub
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::fetch_byte_sub`]: AtomicPtr::fetch_byte_sub
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_xsub<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -188,8 +314,22 @@ pub const unsafe fn atomic_xsub<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_and`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::fetch_and`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `fetch_and` method. For example, [`AtomicBool::fetch_and`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_and`]: AtomicI32::fetch_and
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::fetch_and`]: AtomicPtr::fetch_and
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_and<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -201,8 +341,16 @@ pub const unsafe fn atomic_and<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// This is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_nand`].
+/// Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
-/// [`AtomicBool`] type via the `fetch_nand` method. For example, [`AtomicBool::fetch_nand`].
+/// [`atomic`] types via the `fetch_nand` method. For example, [`AtomicBool::fetch_nand`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_nand`]: AtomicI32::fetch_nand
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_nand<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -214,8 +362,22 @@ pub const unsafe fn atomic_nand<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_or`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::fetch_or`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `fetch_or` method. For example, [`AtomicBool::fetch_or`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_or`]: AtomicI32::fetch_or
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::fetch_or`]: AtomicPtr::fetch_or
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_or<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -227,8 +389,22 @@ pub const unsafe fn atomic_or<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// `T` must be an integer or pointer type.
 /// `U` must be the same as `T` if that is an integer type, or `usize` if `T` is a pointer type.
 ///
+/// # Safety
+///
+/// * If `T` is an integer type, this is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_xor`].
+///   Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
+/// * If `T` is a pointer type, this is equivalent to [`AtomicPtr<P>::from_ptr`] followed by [`AtomicPtr<P>::fetch_xor`],
+///   where `P` is the pointee type of the pointer.
+///   Refer to the documentation of [`AtomicPtr<P>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] types via the `fetch_xor` method. For example, [`AtomicBool::fetch_xor`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_xor`]: AtomicI32::fetch_xor
+/// [`AtomicPtr<P>::from_ptr`]: AtomicPtr::from_ptr
+/// [`AtomicPtr<P>::fetch_xor`]: AtomicPtr::fetch_xor
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_xor<T: Copy, U: Copy, const ORD: AtomicOrdering>(
@@ -239,8 +415,16 @@ pub const unsafe fn atomic_xor<T: Copy, U: Copy, const ORD: AtomicOrdering>(
 /// Maximum with the current value using a signed comparison.
 /// `T` must be a signed integer type.
 ///
+/// # Safety
+///
+/// This is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_max`].
+/// Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] signed integer types via the `fetch_max` method. For example, [`AtomicI32::fetch_max`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_max`]: AtomicI32::fetch_max
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_max<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
@@ -248,8 +432,16 @@ pub const unsafe fn atomic_max<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, 
 /// Minimum with the current value using a signed comparison.
 /// `T` must be a signed integer type.
 ///
+/// # Safety
+///
+/// This is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_min`].
+/// Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] signed integer types via the `fetch_min` method. For example, [`AtomicI32::fetch_min`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicI32::from_ptr
+/// [`Atomic<T>::fetch_min`]: AtomicI32::fetch_min
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_min<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
@@ -257,8 +449,16 @@ pub const unsafe fn atomic_min<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, 
 /// Minimum with the current value using an unsigned comparison.
 /// `T` must be an unsigned integer type.
 ///
+/// # Safety
+///
+/// This is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_min`].
+/// Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] unsigned integer types via the `fetch_min` method. For example, [`AtomicU32::fetch_min`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicU32::from_ptr
+/// [`Atomic<T>::fetch_min`]: AtomicU32::fetch_min
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_umin<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
@@ -266,8 +466,16 @@ pub const unsafe fn atomic_umin<T: Copy, const ORD: AtomicOrdering>(dst: *mut T,
 /// Maximum with the current value using an unsigned comparison.
 /// `T` must be an unsigned integer type.
 ///
+/// # Safety
+///
+/// This is equivalent to [`Atomic<T>::from_ptr`] followed by [`Atomic<T>::fetch_max`].
+/// Refer to the documentation of [`Atomic<T>::from_ptr`] for safety requirements.
+///
 /// The stabilized version of this intrinsic is available on the
 /// [`atomic`] unsigned integer types via the `fetch_max` method. For example, [`AtomicU32::fetch_max`].
+///
+/// [`Atomic<T>::from_ptr`]: AtomicU32::from_ptr
+/// [`Atomic<T>::fetch_max`]: AtomicU32::fetch_max
 #[rustc_intrinsic]
 #[rustc_nounwind]
 pub const unsafe fn atomic_umax<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
@@ -363,6 +571,30 @@ pub const fn prefetch_write_instruction<T, const LOCALITY: i32>(data: *const T) 
 #[rustc_nounwind]
 pub fn breakpoint();
 
+/// A container for the string arguments passed to [`codeview_annotation`].
+#[unstable(feature = "codeview_annotation", issue = "163964")]
+pub trait CodeViewAnnotationArgs {
+    /// The string arguments to `codeview_annotation`.
+    const ARGS: &[&str];
+}
+
+/// Emits a call to [`llvm.codeview.annotation`](https://llvm.org/docs/LangRef.html#llvm-codeview-annotation-intrinsic)
+/// which results in [`CodeViewAnnotationArgs::ARGS`] being written to the
+/// PDB as an `S_ANNOTATION` record.
+///
+/// Works only with targets that use PDB debuginfo and with the LLVM backend.
+/// Is a no-op on other targets and backends.
+#[unstable(feature = "codeview_annotation", issue = "163964")]
+#[rustc_intrinsic]
+#[rustc_nounwind]
+#[miri::intrinsic_fallback_is_spec]
+pub fn codeview_annotation<T: CodeViewAnnotationArgs>() {
+    // const block to catch any errors in `T::ARGS`
+    const {
+        let _ignore = T::ARGS;
+    }
+}
+
 /// Magic intrinsic that derives its meaning from attributes
 /// attached to the function.
 ///
@@ -376,26 +608,23 @@ pub fn breakpoint();
 #[rustc_intrinsic]
 pub fn rustc_peek<T>(_: T) -> T;
 
-/// Aborts the execution of the process.
+/// Ungracefully aborts the execution of the process.
 ///
-/// Note that, unlike most intrinsics, this is safe to call;
-/// it does not require an `unsafe` block.
-/// Therefore, implementations must not require the user to uphold
-/// any safety invariants.
+/// This is the intrinsic for directly implementing [`core::process::abort_immediate`] which, on
+/// most platforms, will invoke an invalid instruction. On Unix, the process will probably
+/// terminate with a signal like `SIGABRT`, `SIGILL`, `SIGTRAP`, `SIGSEGV` or `SIGBUS`. The
+/// precise behavior is not guaranteed and not stable.
 ///
 /// [`std::process::abort`](../../std/process/fn.abort.html) is to be preferred if possible,
 /// as its behavior is more user-friendly and more stable.
 ///
-/// The current implementation of `intrinsics::abort` is to invoke an invalid instruction,
-/// on most platforms.
-/// On Unix, the
-/// process will probably terminate with a signal like `SIGABRT`, `SIGILL`, `SIGTRAP`, `SIGSEGV` or
-/// `SIGBUS`.  The precise behavior is not guaranteed and not stable.
+/// Note that, unlike most intrinsics, this is safe to call; it does not require an `unsafe` block.
+/// Therefore, implementations must not require the user to uphold any safety invariants.
 ///
-/// The stabilization-track version of this intrinsic is [`core::process::abort_immediate`].
+/// The stabilized version of this intrinsic is [`core::process::abort_immediate`].
 #[rustc_nounwind]
 #[rustc_intrinsic]
-pub fn abort() -> !;
+pub const fn abort_immediate() -> !;
 
 /// Informs the optimizer that this point in the code is not reachable,
 /// enabling further optimizations.
@@ -1355,6 +1584,9 @@ pub const fn fmaf128(a: f128, b: f128, c: f128) -> f128;
 /// and add instructions. It is unspecified whether or not a fused operation
 /// is selected, and that may depend on optimization level and context, for
 /// example.
+///
+/// The stabilized version of this intrinsic is
+/// [`f16::mul_add_relaxed`](../../std/primitive.f16.html#method.mul_add_relaxed)
 #[inline]
 #[rustc_intrinsic]
 #[rustc_nounwind]
@@ -1371,6 +1603,9 @@ pub const fn fmuladdf16(a: f16, b: f16, c: f16) -> f16 {
 /// and add instructions. It is unspecified whether or not a fused operation
 /// is selected, and that may depend on optimization level and context, for
 /// example.
+///
+/// The stabilized version of this intrinsic is
+/// [`f32::mul_add_relaxed`](../../std/primitive.f32.html#method.mul_add_relaxed)
 #[inline]
 #[rustc_intrinsic]
 #[rustc_nounwind]
@@ -1387,6 +1622,9 @@ pub const fn fmuladdf32(a: f32, b: f32, c: f32) -> f32 {
 /// and add instructions. It is unspecified whether or not a fused operation
 /// is selected, and that may depend on optimization level and context, for
 /// example.
+///
+/// The stabilized version of this intrinsic is
+/// [`f64::mul_add_relaxed`](../../std/primitive.f64.html#method.mul_add_relaxed)
 #[inline]
 #[rustc_intrinsic]
 #[rustc_nounwind]
@@ -1403,6 +1641,9 @@ pub const fn fmuladdf64(a: f64, b: f64, c: f64) -> f64 {
 /// and add instructions. It is unspecified whether or not a fused operation
 /// is selected, and that may depend on optimization level and context, for
 /// example.
+///
+/// The stabilized version of this intrinsic is
+/// [`f128::mul_add_relaxed`](../../std/primitive.f128.html#method.mul_add_relaxed)
 #[inline]
 #[rustc_intrinsic]
 #[rustc_nounwind]
@@ -2084,7 +2325,7 @@ pub const unsafe fn unchecked_mul<T: Copy>(x: T, y: T) -> T;
 #[rustc_intrinsic_const_stable_indirect]
 #[rustc_nounwind]
 #[rustc_intrinsic]
-#[rustc_allow_const_fn_unstable(const_trait_impl, funnel_shifts)]
+#[rustc_allow_const_fn_unstable(const_trait_impl)]
 #[miri::intrinsic_fallback_is_spec]
 pub const fn rotate_left<T: [const] fallback::FunnelShift>(x: T, shift: u32) -> T {
     // Make sure to call the intrinsic for `funnel_shl`, not the fallback impl.
@@ -2106,7 +2347,7 @@ pub const fn rotate_left<T: [const] fallback::FunnelShift>(x: T, shift: u32) -> 
 #[rustc_intrinsic_const_stable_indirect]
 #[rustc_nounwind]
 #[rustc_intrinsic]
-#[rustc_allow_const_fn_unstable(const_trait_impl, funnel_shifts)]
+#[rustc_allow_const_fn_unstable(const_trait_impl)]
 #[miri::intrinsic_fallback_is_spec]
 pub const fn rotate_right<T: [const] fallback::FunnelShift>(x: T, shift: u32) -> T {
     // Make sure to call the intrinsic for `funnel_shr`, not the fallback impl.
@@ -2202,11 +2443,11 @@ pub const fn saturating_sub<T: Copy>(a: T, b: T) -> T;
 ///
 /// Safe versions of this intrinsic are available on the integer primitives
 /// via the `funnel_shl` method. For example, [`u32::funnel_shl`].
+#[rustc_intrinsic_const_stable_indirect]
 #[rustc_intrinsic]
 #[rustc_nounwind]
-#[rustc_const_unstable(feature = "funnel_shifts", issue = "145686")]
-#[unstable(feature = "funnel_shifts", issue = "145686")]
 #[track_caller]
+#[rustc_allow_const_fn_unstable(const_trait_impl, core_intrinsics_fallbacks)]
 #[miri::intrinsic_fallback_is_spec]
 pub const unsafe fn unchecked_funnel_shl<T: [const] fallback::FunnelShift>(
     a: T,
@@ -2230,11 +2471,11 @@ pub const unsafe fn unchecked_funnel_shl<T: [const] fallback::FunnelShift>(
 ///
 /// Safer versions of this intrinsic are available on the integer primitives
 /// via the `funnel_shr` method. For example, [`u32::funnel_shr`]
+#[rustc_intrinsic_const_stable_indirect]
 #[rustc_intrinsic]
 #[rustc_nounwind]
-#[rustc_const_unstable(feature = "funnel_shifts", issue = "145686")]
-#[unstable(feature = "funnel_shifts", issue = "145686")]
 #[track_caller]
+#[rustc_allow_const_fn_unstable(const_trait_impl, core_intrinsics_fallbacks)]
 #[miri::intrinsic_fallback_is_spec]
 pub const unsafe fn unchecked_funnel_shr<T: [const] fallback::FunnelShift>(
     a: T,
@@ -2937,25 +3178,6 @@ pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
 #[rustc_intrinsic_const_stable_indirect]
 pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;
 
-#[rustc_intrinsic]
-#[rustc_comptime]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-/// Check if a type represented by a `TypeId` implements a trait represented by a `TypeId`.
-/// It can only be called at compile time, the backends do
-/// not implement it. If it implements the trait the dyn metadata gets returned for vtable access.
-pub fn type_id_vtable(
-    _id: crate::any::TypeId,
-    _trait: crate::any::TypeId,
-) -> Option<ptr::DynMetadata<*const ()>>;
-
-/// Compute the type information of a concrete type.
-/// It can only be called at compile time, the backends do
-/// not implement it.
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_of(_id: crate::any::TypeId) -> crate::mem::type_info::Type;
-
 /// Gets a static string slice containing the name of a type.
 ///
 /// Note that, unlike most intrinsics, this can only be called at compile-time
@@ -2969,121 +3191,6 @@ pub fn type_of(_id: crate::any::TypeId) -> crate::mem::type_info::Type;
 #[rustc_intrinsic]
 #[rustc_comptime]
 pub fn type_name<T: ?Sized>() -> &'static str;
-
-/// Gets an identifier which is globally unique to the specified type. This
-/// function will return the same value for a type regardless of whichever
-/// crate it is invoked in.
-///
-/// Note that, unlike most intrinsics, this can only be called at compile-time
-/// as backends do not have an implementation for it. The only caller (its
-/// stable counterpart) wraps this intrinsic call in a `const` block so that
-/// backends only see an evaluated constant.
-///
-/// The stabilized version of this intrinsic is [`core::any::TypeId::of`].
-#[rustc_nounwind]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_intrinsic]
-#[rustc_comptime]
-pub fn type_id<T: ?Sized>() -> crate::any::TypeId;
-
-/// Tests (at compile-time) if two [`crate::any::TypeId`] instances identify the
-/// same type. This is necessary because at const-eval time the actual discriminating
-/// data is opaque and cannot be inspected directly.
-///
-/// The stabilized version of this intrinsic is the [PartialEq] impl for [`core::any::TypeId`].
-#[rustc_nounwind]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_intrinsic]
-#[rustc_do_not_const_check]
-pub const fn type_id_eq(a: crate::any::TypeId, b: crate::any::TypeId) -> bool {
-    // SAFETY: we know `TypeId` is 16 bytes of initialized data.
-    // This is runtime-only code so we do not have to worry about provenance.
-    unsafe { crate::mem::transmute::<_, u128>(a) == crate::mem::transmute::<_, u128>(b) }
-}
-
-/// Returns whether the type represented by this `TypeId` is a signed integer.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::is_signed`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_is_signed(_id: crate::any::TypeId) -> bool;
-
-/// Gets the length of the array represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::array_len`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_array_len(_id: crate::any::TypeId) -> usize;
-
-/// Gets the type of each element of the array or slice represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::element_ty`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_element_ty(_id: crate::any::TypeId) -> Option<crate::any::TypeId>;
-
-/// Gets the size of the type represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::size`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn size_of_type_id(_id: crate::any::TypeId) -> Option<usize>;
-
-/// Gets the number of variants of the type represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::variants`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_variants(_id: crate::any::TypeId) -> usize;
-
-/// Gets the name of the variant represented by the base `TypeId` and variant_idx.
-///
-/// The more user-friendly version of this intrinsic is [`core::mem::type_info::VariantId::name`].
-///
-/// [`TypeId`]: crate::any::TypeId
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn variant_name(_base: crate::any::TypeId, _variant_index: usize) -> &'static str;
-
-/// Returns true when the variant represented by the base `TypeId` and variant_idx is non
-/// exhaustive.
-///
-/// The more user-friendly version of this intrinsic is
-/// [`core::mem::type_info::VariantId::non_exhaustive`].
-///
-/// [`TypeId`]: crate::any::TypeId
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn variant_non_exhaustive(base: crate::any::TypeId, variant: usize) -> bool;
-
-/// Gets the number of fields at the given `variant_index` represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::fields`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_fields(_id: crate::any::TypeId, _variant_index: usize) -> usize;
-
-/// Gets the [`FieldRepresentingType`]'s `TypeId` at the given index of the type represented by this `TypeId`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::field`].
-///
-/// [`FieldRepresentingType`]: crate::field::FieldRepresentingType
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_field_representing_type(
-    _id: crate::any::TypeId,
-    _variant_index: usize,
-    _field_index: usize,
-) -> crate::any::TypeId;
 
 /// Gets the actual field `TypeId` of the [`FieldRepresentingType`]'s `TypeId`.
 ///
@@ -3116,48 +3223,6 @@ pub fn field_representing_type_name(_frt_type_id: crate::any::TypeId) -> &'stati
 #[unstable(feature = "core_intrinsics", issue = "none")]
 #[rustc_comptime]
 pub fn field_representing_type_offset(_frt_type_id: crate::any::TypeId) -> usize;
-
-/// Given a `TypeId` that represents a function pointer returns an [`core::mem::type_info::FnPtr`].
-/// When called on something else this returns `None`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::function_ptr`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_function_ptr(_type_id: crate::any::TypeId) -> Option<crate::mem::type_info::FnPtr>;
-
-/// Checks whether this type is non-exhaustive.
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn non_exhaustive(_id: crate::any::TypeId) -> bool;
-
-/// Returns the list of generic args on this type.
-/// Only meaningful for Adts, closures, ... Everything else returns an empty slice.
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_generics(_id: crate::any::TypeId) -> &'static [crate::mem::type_info::Generic];
-
-// FIXME(reflection): Pick a consistent naming scheme for the intrinsics. Right now we got
-// type_id_<something>, <something>_type_id and intrinsics not mentioning type_id at all.
-/// Given a `TypeId` that represents a pointer this returns the `TypeId` which that pointer
-/// points to. When called on anything else this returns None.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::points_to`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_points_to(_id: crate::any::TypeId) -> Option<crate::any::TypeId>;
-
-/// Given a `TypeId` that represents a pointer returns whether that pointer is mutable.
-/// When called on anything else this returns `false`.
-///
-/// The more user-friendly version of this intrinsic is [`core::any::TypeId::points_mutably`].
-#[rustc_intrinsic]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_comptime]
-pub fn type_id_points_mutably(_id: crate::any::TypeId) -> bool;
 
 /// Lowers in MIR to `Rvalue::Aggregate` with `AggregateKind::RawPtr`.
 ///
@@ -3632,7 +3697,8 @@ pub const fn maximumf128(x: f128, y: f128) -> f128 {
 #[rustc_intrinsic_const_stable_indirect]
 #[rustc_intrinsic]
 #[miri::intrinsic_fallback_is_spec]
-pub const fn fabs<T: const bounds::FloatPrimitive>(x: T) -> T {
+#[rustc_do_not_const_check] // use built-in impl to avoid const-checks in the fallback body.
+pub const fn fabs<T: bounds::FloatPrimitive>(x: T) -> T {
     T::from_bits(x.to_bits() & !T::SIGN_MASK)
 }
 

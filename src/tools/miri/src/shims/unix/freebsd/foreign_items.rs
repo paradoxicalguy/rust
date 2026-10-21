@@ -35,7 +35,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )? {
                     ThreadNameResult::Ok => Scalar::from_u32(0),
                     ThreadNameResult::NameTooLong => unreachable!(),
-                    ThreadNameResult::ThreadNotFound => this.eval_libc("ESRCH"),
                 };
                 this.write_scalar(res, dest)?;
             }
@@ -54,7 +53,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     ThreadNameResult::Ok => Scalar::from_u32(0),
                     // `NameTooLong` is possible when the buffer is zero sized,
                     ThreadNameResult::NameTooLong => Scalar::from_u32(0),
-                    ThreadNameResult::ThreadNotFound => this.eval_libc("ESRCH"),
                 };
                 this.write_scalar(res, dest)?;
             }
@@ -143,29 +141,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this._umtx_op(obj, op, val, uaddr, uaddr2, dest)?;
             }
 
-            // File related shims
-            "stat@FBSD_1.0" => {
-                let [path, buf] =
-                    this.check_shim_sig_deprecated(abi, CanonAbi::C, link_name, args)?;
-                let result = this.stat(path, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "lstat@FBSD_1.0" => {
-                let [path, buf] =
-                    this.check_shim_sig_deprecated(abi, CanonAbi::C, link_name, args)?;
-                let result = this.lstat(path, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "fstat@FBSD_1.0" => {
-                let [fd, buf] =
-                    this.check_shim_sig_deprecated(abi, CanonAbi::C, link_name, args)?;
-                let result = this.fstat(fd, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "readdir@FBSD_1.0" => {
-                let [dirp] = this.check_shim_sig_deprecated(abi, CanonAbi::C, link_name, args)?;
-                this.readdir(dirp, dest)?;
-            }
             // Miscellaneous
             "__error" => {
                 let [] = this.check_shim_sig_deprecated(abi, CanonAbi::C, link_name, args)?;
@@ -176,7 +151,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // FreeBSD uses __xuname under the hood to implement uname, see:
                 // https://github.com/freebsd/freebsd-src/blob/3542d60fb8042474f66fbf2d779ed8c5a80d0f78/sys/sys/utsname.h#L64
                 // https://github.com/freebsd/freebsd-src/blob/3542d60fb8042474f66fbf2d779ed8c5a80d0f78/lib/libc/gen/uname.c#L44
-                let [size, uname] = this.check_shim_sig(
+                let [size, uname] = &this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, *_) -> i32),
                     (link_name, abi, args),
                 )?;

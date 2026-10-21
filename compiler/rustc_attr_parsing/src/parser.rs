@@ -434,7 +434,7 @@ fn expr_to_lit<'sess>(
                     let lit = MetaItemLit {
                         symbol: token_lit.symbol,
                         suffix: token_lit.suffix,
-                        kind: LitKind::Err(err.emit()),
+                        kind: LitKind::Err(err.emit_err()),
                         span: expr.span,
                     };
                     Ok(Some(lit))
@@ -791,5 +791,9 @@ impl MetaItemListParser {
     pub fn as_single(&self) -> Option<&MetaItemOrLitParser> {
         let mut iter = self.mixed();
         iter.next().filter(|_| iter.next().is_none())
+    }
+
+    pub fn sub_parsers(&self) -> &[MetaItemOrLitParser] {
+        &self.sub_parsers
     }
 }

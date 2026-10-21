@@ -1,9 +1,10 @@
 use std::assert_matches;
 
 use rustc_abi::{BackendRepr, FieldsShape, Scalar, Size, TagEncoding, Variants};
+use rustc_middle::ty;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutCx, TyAndLayout};
-use rustc_middle::{bug, ty};
+use rustc_span::bug;
 
 /// Enforce some basic invariants on layouts.
 pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayout<'tcx>) {
@@ -309,16 +310,10 @@ pub(super) fn layout_sanity_check<'tcx>(cx: &LayoutCx<'tcx>, layout: &TyAndLayou
                     }
 
                     // Ensure that for niche encoded tags the discriminant coincides with the variant index.
-                    let val = layout.ty.discriminant_for_variant(tcx, idx).unwrap().val;
-                    if val != u128::from(idx.as_u32()) {
-                        let adt_def = layout.ty.ty_adt_def().unwrap();
-                        cx.tcx().dcx().span_delayed_bug(
-                            cx.tcx().def_span(adt_def.did()),
-                            format!(
-                                "variant {idx:?} has discriminant {val:?} in niche-encoded type"
-                            ),
-                        );
-                    }
+                    assert_eq!(
+                        layout.ty.discriminant_for_variant(tcx, idx).unwrap().val,
+                        u128::from(idx.as_u32()),
+                    );
                 }
             }
             for variant in variants.iter() {

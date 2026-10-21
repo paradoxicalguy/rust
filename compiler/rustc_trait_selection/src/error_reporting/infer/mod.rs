@@ -51,15 +51,15 @@ use std::path::PathBuf;
 use std::{cmp, fmt, iter};
 
 use rustc_abi::ExternAbi;
+use rustc_attr_ir::diagnostic::{CustomDiagnostic, Directive, FormatArgs};
+use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::{Applicability, Diag, DiagStyledString, IntoDiagArg, StringPart, pluralize};
-use rustc_hir::attrs::diagnostic::{CustomDiagnostic, Directive, FormatArgs};
+use rustc_hir as hir;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{self as hir, find_attr};
 use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_macros::extension;
-use rustc_middle::bug;
 use rustc_middle::traits::PatternOriginExpr;
 use rustc_middle::ty::error::{ExpectedFound, TypeError, TypeErrorToStringExt};
 use rustc_middle::ty::print::{PrintTraitRefExt as _, WrapBinderMode, with_forced_trimmed_paths};
@@ -67,7 +67,7 @@ use rustc_middle::ty::{
     self, List, Mutability, ParamEnv, Region, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable,
     TypeVisitable, TypeVisitableExt, Unnormalized,
 };
-use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Pos, Span, sym};
+use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Pos, Span, bug, sym};
 use thin_vec::ThinVec;
 use tracing::{debug, instrument};
 
@@ -130,7 +130,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             let ocx = ObligationCtxt::new(self);
             let normalized_fn_sig = ocx.normalize(&ObligationCause::dummy(), param_env, fn_sig);
             if ocx.evaluate_obligations_error_on_ambiguity().no_errors() {
-                let normalized_fn_sig = self.resolve_vars_if_possible(normalized_fn_sig);
+                let normalized_fn_sig = self.deeply_resolve_ignoring_regions(normalized_fn_sig);
                 if !normalized_fn_sig.has_infer() {
                     return normalized_fn_sig;
                 }
@@ -158,7 +158,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     where
         M: FnOnce(String) -> Diag<'a>,
     {
-        let actual_ty = self.resolve_vars_if_possible(actual_ty);
+        let actual_ty = self.deeply_resolve_ignoring_regions(actual_ty);
         debug!("type_error_struct_with_diag({:?}, {:?})", sp, actual_ty);
 
         let mut err = mk_diag(self.ty_to_string(actual_ty));
@@ -336,7 +336,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 span: Some(span),
                 root_ty,
             } => {
-                let expected_ty = self.resolve_vars_if_possible(root_ty);
+                let expected_ty = self.deeply_resolve_ignoring_regions(root_ty);
                 if !matches!(
                     expected_ty.kind(),
                     ty::Infer(ty::InferTy::TyVar(_) | ty::InferTy::FreshTy(_))
@@ -414,7 +414,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     match scrut_ty {
                         Some(ty) if expected == ty => {
                             let source_map = self.tcx.sess.source_map();
-                            err.span_suggestion(
+                            err.span_suggestion_short(
                                 source_map.end_point(cause.span),
                                 "try removing this `?`",
                                 "",
@@ -453,7 +453,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         match scrut_ty {
                             Some(ty) if expected == ty => {
                                 let source_map = self.tcx.sess.source_map();
-                                err.span_suggestion(
+                                err.span_suggestion_short(
                                     source_map.end_point(cause.span),
                                     "try removing this `?`",
                                     "",
@@ -466,7 +466,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
                 _ => {
                     // `prior_arm_ty` can be `!`, `expected` will have better info when present.
-                    let t = self.resolve_vars_if_possible(match exp_found {
+                    let t = self.deeply_resolve_ignoring_regions(match exp_found {
                         Some(ty::error::ExpectedFound { expected, .. }) => expected,
                         _ => prior_arm_ty,
                     });
@@ -1576,7 +1576,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let (expected_found, exp_found, is_simple_error, values, param_env) = match values {
             None => (None, Mismatch::Fixed("type"), false, None, None),
             Some(ty::ParamEnvAnd { param_env, value: values }) => {
-                let values = self.resolve_vars_if_possible(values);
+                let values = self.deeply_resolve_ignoring_regions(values);
                 let (is_simple_error, exp_found) = match values {
                     ValuePairs::Terms(ExpectedFound { expected, found }) => {
                         match (expected.kind(), found.kind()) {
@@ -1607,15 +1607,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     ValuePairs::TraitRefs(_) => (false, Mismatch::Fixed("trait")),
                     ValuePairs::Aliases(ExpectedFound { expected, .. }) => {
                         let def_id = match expected.kind {
-                            ty::AliasTermKind::ProjectionTy { def_id } => def_id.into(),
-                            ty::AliasTermKind::InherentTy { def_id } => def_id.into(),
-                            ty::AliasTermKind::OpaqueTy { def_id } => def_id.into(),
-                            ty::AliasTermKind::FreeTy { def_id } => def_id.into(),
-                            ty::AliasTermKind::AnonConst { def_id } => def_id.into(),
-                            ty::AliasTermKind::ProjectionConst { def_id } => def_id.into(),
-                            ty::AliasTermKind::FreeConst { def_id } => def_id.into(),
-                            ty::AliasTermKind::InherentConstSelf { def_id } => def_id.into(),
-                            ty::AliasTermKind::InherentConstImpl { def_id } => def_id.into(),
+                            ty::AliasTermKind::ProjectionTy { def_id }
+                            | ty::AliasTermKind::InherentTy { def_id }
+                            | ty::AliasTermKind::OpaqueTy { def_id }
+                            | ty::AliasTermKind::FreeTy { def_id }
+                            | ty::AliasTermKind::AnonConst { def_id }
+                            | ty::AliasTermKind::ProjectionConst { def_id }
+                            | ty::AliasTermKind::FreeConst { def_id }
+                            | ty::AliasTermKind::InherentConstSelf { def_id }
+                            | ty::AliasTermKind::InherentConstImpl { def_id } => def_id,
                         };
                         (false, Mismatch::Fixed(self.tcx.def_descr(def_id)))
                     }
@@ -1988,7 +1988,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     ) -> Vec<TypeErrorAdditionalDiags> {
         let mut suggestions = Vec::new();
         let span = trace.cause.span;
-        let values = self.resolve_vars_if_possible(trace.values);
+        let values = self.deeply_resolve_ignoring_regions(trace.values);
         if let Some((expected, found)) = values.ty() {
             match (expected.kind(), found.kind()) {
                 (ty::Tuple(_), ty::Tuple(_)) => {}
@@ -2344,7 +2344,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
             }
             ValuePairs::PolySigs(exp_found) => {
-                let exp_found = self.resolve_vars_if_possible(exp_found);
+                let exp_found = self.deeply_resolve_ignoring_regions(exp_found);
                 if exp_found.references_error() {
                     return None;
                 }
@@ -2369,7 +2369,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         exp_found: ty::error::ExpectedFound<ty::Term<'tcx>>,
         long_ty_path: &mut Option<PathBuf>,
     ) -> Option<(DiagStyledString, DiagStyledString)> {
-        let exp_found = self.resolve_vars_if_possible(exp_found);
+        let exp_found = self.deeply_resolve_ignoring_regions(exp_found);
         if exp_found.references_error() {
             return None;
         }
@@ -2441,7 +2441,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         &self,
         exp_found: ty::error::ExpectedFound<T>,
     ) -> Option<(DiagStyledString, DiagStyledString)> {
-        let exp_found = self.resolve_vars_if_possible(exp_found);
+        let exp_found = self.deeply_resolve_ignoring_regions(exp_found);
         if exp_found.references_error() {
             return None;
         }
@@ -2467,7 +2467,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     /// FloatVar inference type are compatible with themselves or their concrete types (Int and
     /// Float types, respectively). When comparing two ADTs, these rules apply recursively.
     pub fn same_type_modulo_infer<T: relate::Relate<TyCtxt<'tcx>>>(&self, a: T, b: T) -> bool {
-        let (a, b) = self.resolve_vars_if_possible((a, b));
+        let (a, b) = self.deeply_resolve_ignoring_regions((a, b));
         SameTypeModuloInfer(self).relate(a, b).is_ok()
     }
 }

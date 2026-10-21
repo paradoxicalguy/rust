@@ -12,10 +12,10 @@ use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use rustc_ast::{IntTy, UintTy};
 use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, read_target_uint, write_target_uint};
 use rustc_middle::mir::{self, BinOp, ConstValue, NonDivergingIntrinsic};
+use rustc_middle::ty;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{FloatTy, Ty, TyCtxt, TypeVisitableExt};
-use rustc_middle::{bug, span_bug, ty};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, bug, span_bug, sym};
 use tracing::trace;
 
 use super::memory::MemoryKind;
@@ -293,7 +293,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
 
             sym::caller_location => {
-                let span = self.find_closest_untracked_caller_location();
+                let span = self.caller_location();
                 let val = self.tcx.span_as_caller_location(span);
                 let val =
                     self.const_val_to_op(val, self.tcx.caller_location_ty(), Some(dest.layout))?;

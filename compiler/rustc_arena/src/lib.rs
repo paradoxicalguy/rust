@@ -10,14 +10,13 @@
 // tidy-alphabetical-start
 #![allow(clippy::mut_from_ref)] // Arena allocators are one place where this pattern is fine.
 #![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(never_type))]
+#![cfg_attr(bootstrap, feature(unwrap_infallible))]
 #![cfg_attr(test, feature(test))]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![doc(test(no_crate_inject, attr(deny(warnings))))]
 #![feature(decl_macro)]
 #![feature(dropck_eyepatch)]
 #![feature(rustc_attrs)]
-#![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 
 use std::alloc::Layout;
@@ -52,10 +51,7 @@ unsafe impl<#[may_dangle] T> Drop for ArenaChunk<T> {
 impl<T> ArenaChunk<T> {
     #[inline]
     unsafe fn new(capacity: usize) -> ArenaChunk<T> {
-        ArenaChunk {
-            storage: NonNull::from(Box::leak(Box::new_uninit_slice(capacity))),
-            entries: 0,
-        }
+        ArenaChunk { storage: Box::into_non_null(Box::new_uninit_slice(capacity)), entries: 0 }
     }
 
     /// Destroys this arena chunk.

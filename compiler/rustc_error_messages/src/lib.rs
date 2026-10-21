@@ -87,21 +87,22 @@ pub struct SpanLabel {
 pub struct MultiSpan {
     primary_spans: Vec<Span>,
     span_labels: Vec<(Span, DiagMessage)>,
+    span_context: Vec<Span>,
 }
 
 impl MultiSpan {
     #[inline]
     pub fn new() -> MultiSpan {
-        MultiSpan { primary_spans: vec![], span_labels: vec![] }
+        MultiSpan { primary_spans: vec![], span_labels: vec![], span_context: vec![] }
     }
 
     pub fn from_span(primary_span: Span) -> MultiSpan {
-        MultiSpan { primary_spans: vec![primary_span], span_labels: vec![] }
+        MultiSpan { primary_spans: vec![primary_span], span_labels: vec![], span_context: vec![] }
     }
 
     pub fn from_spans(mut vec: Vec<Span>) -> MultiSpan {
-        vec.sort();
-        MultiSpan { primary_spans: vec, span_labels: vec![] }
+        vec.sort_by_key(|span| span.lo_hi());
+        MultiSpan { primary_spans: vec, span_labels: vec![], span_context: vec![] }
     }
 
     pub fn push_primary_span(&mut self, primary_span: Span) {
@@ -110,6 +111,10 @@ impl MultiSpan {
 
     pub fn push_span_label(&mut self, span: Span, label: impl Into<DiagMessage>) {
         self.span_labels.push((span, label.into()));
+    }
+
+    pub fn push_span_context(&mut self, span: Span) {
+        self.span_context.push(span);
     }
 
     pub fn push_span_diag(&mut self, span: Span, diag: DiagMessage) {
@@ -182,6 +187,10 @@ impl MultiSpan {
         span_labels
     }
 
+    pub fn span_context(&self) -> &[Span] {
+        &self.span_context
+    }
+
     /// Returns the span labels as contained by `MultiSpan`.
     pub fn span_labels_raw(&self) -> &[(Span, DiagMessage)] {
         &self.span_labels
@@ -204,6 +213,12 @@ impl MultiSpan {
 impl From<Span> for MultiSpan {
     fn from(span: Span) -> MultiSpan {
         MultiSpan::from_span(span)
+    }
+}
+
+impl From<Option<Span>> for MultiSpan {
+    fn from(span: Option<Span>) -> MultiSpan {
+        MultiSpan::from_spans(span.into_iter().collect())
     }
 }
 

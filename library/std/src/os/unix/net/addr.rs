@@ -1,4 +1,4 @@
-use crate::bstr::ByteStr;
+use crate::byte_str::ByteStr;
 use crate::ffi::OsStr;
 #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use crate::os::net::linux_ext;
@@ -87,7 +87,7 @@ enum AddressKind<'a> {
 ///         return
 ///     }
 /// };
-/// let addr = socket.local_addr().expect("Couldn't get local address");
+/// let addr = socket.local_addr().expect("`UnixListener::local_addr` should not fail");
 /// ```
 #[derive(Clone)]
 #[stable(feature = "unix_socket", since = "1.10.0")]
@@ -122,6 +122,8 @@ impl SocketAddr {
             len = core::slice::memchr::memchr(0, sun_path)
                 .map_or(len, |new_len| (new_len + SUN_PATH_OFFSET) as libc::socklen_t);
         }
+
+        len = len.min(size_of::<libc::sockaddr_un>() as libc::socklen_t);
 
         if len == 0 {
             // When there is a datagram from unnamed unix socket
@@ -186,7 +188,7 @@ impl SocketAddr {
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixListener::bind("/tmp/sock")?;
-    ///     let addr = socket.local_addr().expect("Couldn't get local address");
+    ///     let addr = socket.local_addr().expect("`UnixListener::local_addr` should not fail");
     ///     assert_eq!(addr.is_unnamed(), false);
     ///     Ok(())
     /// }
@@ -200,7 +202,7 @@ impl SocketAddr {
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixDatagram::unbound()?;
-    ///     let addr = socket.local_addr().expect("Couldn't get local address");
+    ///     let addr = socket.local_addr().expect("`UnixListener::local_addr` should not fail");
     ///     assert_eq!(addr.is_unnamed(), true);
     ///     Ok(())
     /// }
@@ -224,7 +226,7 @@ impl SocketAddr {
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixListener::bind("/tmp/sock")?;
-    ///     let addr = socket.local_addr().expect("Couldn't get local address");
+    ///     let addr = socket.local_addr().expect("`UnixListener::local_addr` should not fail");
     ///     assert_eq!(addr.as_pathname(), Some(Path::new("/tmp/sock")));
     ///     Ok(())
     /// }
@@ -238,7 +240,7 @@ impl SocketAddr {
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixDatagram::unbound()?;
-    ///     let addr = socket.local_addr().expect("Couldn't get local address");
+    ///     let addr = socket.local_addr().expect("`UnixListener::local_addr` should not fail");
     ///     assert_eq!(addr.as_pathname(), None);
     ///     Ok(())
     /// }

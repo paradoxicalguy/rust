@@ -3,11 +3,10 @@ mod adt;
 use std::borrow::Cow;
 
 use rustc_abi::{ExternAbi, FieldIdx};
-use rustc_hir::attrs::lang_items::LangItem;
-use rustc_middle::span_bug;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, FnHeader, FnSigKind, FnSigTys, ScalarInt, Ty, TyCtxt};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, span_bug, sym};
 
 use crate::const_eval::CompileTimeMachine;
 use crate::interpret::{
@@ -92,9 +91,7 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
                                 self.project_downcast_named(&field_dest, sym::Slice)?;
                             variant
                         }
-                        ty::Adt(adt_def, generics) => {
-                            self.write_adt_type_info(&field_dest, (ty, *adt_def), generics)?
-                        }
+                        ty::Adt(adt_def, _) => self.write_adt_type_info(&field_dest, *adt_def)?,
                         ty::Bool => {
                             let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Bool)?;

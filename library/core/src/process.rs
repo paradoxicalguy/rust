@@ -35,9 +35,29 @@
 /// Other signals such as `SIGABRT`, `SIGTRAP`, `SIGSEGV`, and `SIGBUS` may be
 /// produced instead, depending on specifics. This is not an exhaustive list.
 #[unstable(feature = "abort_immediate", issue = "154601")]
+#[rustc_const_unstable(feature = "abort_immediate", issue = "154601")]
 #[cold]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 #[doc(alias = "halt")]
-pub fn abort_immediate() -> ! {
-    crate::intrinsics::abort()
+pub const fn abort_immediate() -> ! {
+    crate::intrinsics::abort_immediate()
+}
+
+/// Triggers a debugger breakpoint, pausing execution if possible.
+///
+/// This signals the environment to pause execution if a debugger is attached, and pass control to
+/// the debugger. Execution may then be aborted or continued by the user controlling the debugger.
+///
+/// If possible, this will produce an instruction sequence that allows a debugger to resume *after*
+/// the breakpoint, rather than resuming *at* the breakpoint; however, the exact behavior is
+/// target-specific and debugger-specific, and not guaranteed.
+///
+/// If no debugger is attached, this will typically abort the process but may also continue
+/// execution.
+// NOTE: this is meant to discuss alternatives to `arch::breakpoint`. We may or may not
+// actually want to stabilize both of them.
+#[unstable(feature = "breakpoint", issue = "133724")]
+#[inline(always)]
+pub fn resumable_breakpoint() {
+    crate::intrinsics::breakpoint();
 }

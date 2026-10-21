@@ -10,7 +10,6 @@ use rustc_infer::traits::{
     FromSolverError, PolyTraitObligation, PredicateObligations, ProjectionCacheKey, SelectionError,
     TraitEngine, TraitErrors,
 };
-use rustc_middle::bug;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
@@ -18,6 +17,7 @@ use rustc_middle::ty::{
     TypeVisitableExt, TypeVisitor, TypingMode, may_use_unstable_feature,
 };
 use rustc_next_trait_solver::solve::TyOrConstInferVar;
+use rustc_span::bug;
 use thin_vec::{ThinVec, thin_vec};
 use tracing::{debug, debug_span, instrument};
 
@@ -145,7 +145,7 @@ where
         // this helps to reduce duplicate errors, as well as making
         // debug output much nicer to read and so on.
         debug_assert!(!obligation.param_env.has_non_region_infer());
-        obligation.predicate = infcx.resolve_vars_if_possible(obligation.predicate);
+        obligation.predicate = infcx.deeply_resolve_ignoring_regions(obligation.predicate);
 
         debug!(?obligation, "register_predicate_obligation");
 
@@ -175,12 +175,14 @@ where
             TypingMode::Typeck { defining_opaque_types_and_generators } => {
                 defining_opaque_types_and_generators
             }
-            TypingMode::Coherence
-            | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ }
+            TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ }
             | TypingMode::PostBorrowck { defined_opaque_types: _ }
             | TypingMode::Reflection
             | TypingMode::PostAnalysis
             | TypingMode::Codegen => return Default::default(),
+            TypingMode::Coherence => {
+                unreachable!("old solver coherence")
+            }
         };
 
         if stalled_coroutines.is_empty() {
@@ -236,7 +238,7 @@ where
                 }
 
                 self.infcx
-                    .resolve_vars_if_possible(pending_obligation.obligation.predicate)
+                    .deeply_resolve_ignoring_regions(pending_obligation.obligation.predicate)
                     .visit_with(&mut StalledOnCoroutines {
                         stalled_coroutines: self.stalled_coroutines,
                         cache: Default::default(),
@@ -387,7 +389,8 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
         debug!(?obligation, "pre-resolve");
 
         if obligation.predicate.has_non_region_infer() {
-            obligation.predicate = self.selcx.infcx.resolve_vars_if_possible(obligation.predicate);
+            obligation.predicate =
+                self.selcx.infcx.deeply_resolve_ignoring_regions(obligation.predicate);
         }
 
         let obligation = &pending_obligation.obligation;
@@ -870,8 +873,9 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         trait_obligation: PolyTraitObligation<'tcx>,
         stalled_on: &mut Vec<TyOrConstInferVar>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
+        debug_assert!(!self.selcx.typing_mode().is_coherence(), "old solver coherence");
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
+        if obligation.predicate.is_global() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {
@@ -903,7 +907,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
 
                 debug!(
                     "process_predicate: pending obligation {:?} now stalled on {:?}",
-                    infcx.resolve_vars_if_possible(obligation.clone()),
+                    infcx.deeply_resolve_ignoring_regions(obligation.clone()),
                     stalled_on
                 );
 
@@ -923,9 +927,11 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         project_obligation: PolyProjectionObligation<'tcx>,
         stalled_on: &mut Vec<TyOrConstInferVar>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
+        debug_assert!(!self.selcx.typing_mode().is_coherence(), "old solver coherence");
+
         let tcx = self.selcx.tcx();
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
+        if obligation.predicate.is_global() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {
@@ -954,13 +960,15 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
             }
             ProjectAndUnifyResult::Holds(os) => {
                 let input_projection_term = infcx
-                    .resolve_vars_if_possible(project_obligation.predicate)
+                    .deeply_resolve_ignoring_regions(project_obligation.predicate)
                     .map_bound(|p| p.projection_term);
                 let all_same_projection_term = os.iter().all(|o| {
                     let Some(proj_clause) = o.predicate.as_projection_clause() else {
                         return false;
                     };
-                    infcx.resolve_vars_if_possible(proj_clause).map_bound(|p| p.projection_term)
+                    infcx
+                        .deeply_resolve_ignoring_regions(proj_clause)
+                        .map_bound(|p| p.projection_term)
                         == input_projection_term
                 });
                 if all_same_projection_term {
@@ -1029,7 +1037,7 @@ fn args_infer_vars<'tcx>(
 ) -> impl Iterator<Item = TyOrConstInferVar> {
     selcx
         .infcx
-        .resolve_vars_if_possible(args)
+        .deeply_resolve_ignoring_regions(args)
         .skip_binder() // ok because this check doesn't care about regions
         .iter()
         .filter(|arg| arg.has_non_region_infer())

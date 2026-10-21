@@ -7,7 +7,7 @@ use rustc_data_structures::svh::Svh;
 use rustc_errors::timings::TimingSection;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_metadata::EncodedMetadata;
-use rustc_middle::dep_graph::{DepGraph, WorkProductMap};
+use rustc_middle::dep_graph::{DepGraph, WorkProduct, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, OutputFilenames, OutputType};
 use rustc_session::{IncrCompSession, Session};
@@ -67,30 +67,6 @@ impl Linker {
             }
         });
 
-        if sess.codegen_units().as_usize() == 1 && sess.opts.unstable_opts.time_llvm_passes {
-            codegen_backend.print_pass_timings()
-        }
-
-        if sess.print_llvm_stats() {
-            codegen_backend.print_statistics()
-        }
-
-        if let Some(out_path) = sess.print_llvm_stats_json() {
-            let llvm_stats_json = codegen_backend.print_statistics_json();
-
-            if !llvm_stats_json.is_empty() {
-                if let Err(e) = std::fs::write(&out_path, llvm_stats_json) {
-                    sess.dcx().err(format!("failed to write stats to {}: {}", out_path, e));
-                }
-            } else {
-                sess.dcx().warn(format!(
-                    "requested to print LLVM statistics to JSON file {}, but the codegen backend \
-                    did not provide any statistics",
-                    out_path,
-                ));
-            }
-        }
-
         sess.timings.end_section(sess.dcx(), TimingSection::Codegen);
 
         if sess.opts.incremental.is_some()
@@ -99,9 +75,8 @@ impl Linker {
             let (id, product) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
                 sess,
                 incr_comp_session.as_ref().unwrap(),
-                "metadata",
-                &[("rmeta", path)],
-                &[],
+                WorkProduct::METADATA_WORKPRODUCT_CGU_NAME,
+                &[(OutputType::Metadata.extension(), path)],
             );
             work_products.insert(id, product);
         }

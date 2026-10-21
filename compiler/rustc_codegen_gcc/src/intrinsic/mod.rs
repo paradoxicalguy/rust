@@ -4,7 +4,7 @@ mod simd;
 #[cfg(feature = "master")]
 use std::iter;
 
-use gccjit::{ComparisonOp, Function, FunctionType, RValue, ToRValue, Type, UnaryOp};
+use gccjit::{CType, ComparisonOp, Function, FunctionType, RValue, ToRValue, Type, UnaryOp};
 use rustc_abi::{Align, BackendRepr, HasDataLayout, WrappingRange};
 use rustc_codegen_ssa::base::wants_msvc_seh;
 use rustc_codegen_ssa::common::IntPredicate;
@@ -16,7 +16,7 @@ use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
 use rustc_codegen_ssa::traits::MiscCodegenMethods;
 use rustc_codegen_ssa::traits::{
     ArgAbiBuilderMethods, BaseTypeCodegenMethods, BuilderMethods, ConstCodegenMethods,
-    IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods,
+    IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods, ReturnSlot,
 };
 use rustc_codegen_ssa::{MemFlags, RetagInfo};
 use rustc_data_structures::fx::FxHashSet;
@@ -24,12 +24,10 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::layout::FnAbiOf;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Instance, Ty};
-use rustc_middle::{bug, span_bug};
-use rustc_span::{Span, Symbol, sym};
+use rustc_session::config::OptLevel;
+use rustc_span::{Span, Symbol, bug, span_bug, sym};
 use rustc_target::callconv::{ArgAbi, PassMode};
 
-#[cfg(feature = "master")]
-use crate::abi::FnAbiGccExt;
 use crate::abi::GccType;
 use crate::builder::Builder;
 use crate::common::{SignType, TypeReflection};
@@ -81,7 +79,6 @@ fn get_simple_intrinsic<'gcc, 'tcx>(
         sym::floorf64 => "floor",
         sym::ceilf32 => "ceilf",
         sym::ceilf64 => "ceil",
-        sym::powf128 => return float_intrinsic(cx, cx.type_f128(), "powf128"),
         sym::truncf32 => "truncf",
         sym::truncf64 => "trunc",
         // We match the LLVM backend and lower this to `rint`.
@@ -89,7 +86,6 @@ fn get_simple_intrinsic<'gcc, 'tcx>(
         sym::round_ties_even_f64 => "rint",
         sym::roundf32 => "roundf",
         sym::roundf64 => "round",
-        sym::abort => "abort",
         _ => return None,
     };
     Some(cx.context.get_builtin_function(gcc_name))
@@ -181,14 +177,11 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
         let simple = get_simple_intrinsic(self, name);
 
         let value = match name {
-            _ if simple.is_some() => {
-                let func = simple.expect("simple intrinsic function");
-                self.cx.context.new_call(
-                    self.location,
-                    func,
-                    &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(),
-                )
-            }
+            _ if let Some(func) = simple => self.cx.context.new_call(
+                self.location,
+                func,
+                &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(),
+            ),
             // FIXME(antoyo): We can probably remove these and use the fallback intrinsic implementation.
             sym::minimumf32 | sym::minimumf64 | sym::maximumf32 | sym::maximumf64 => {
                 let (ty, func_name) = match name {
@@ -323,7 +316,9 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
                 unimplemented!();
             }
             sym::va_arg => {
-                unimplemented!();
+                let va_list = args[0].immediate();
+                let gcc_type = self.immediate_backend_type(result.layout);
+                self.va_arg(va_list, gcc_type)
             }
 
             sym::volatile_load | sym::unaligned_volatile_load => {
@@ -365,7 +360,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
                         sym::cttz_nonzero => {
                             self.count_trailing_zeroes_nonzero(width, args[0].immediate())
                         }
-                        sym::ctpop => self.pop_count(args[0].immediate()),
+                        sym::ctpop => self.ctpop(args[0].immediate()),
                         sym::bswap => {
                             if width == 8 {
                                 args[0].immediate() // byte swap a u8/i8 is just a no-op
@@ -612,7 +607,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
 
                 self.on_stack_function_params.borrow_mut().insert(func, FxHashSet::default());
 
-                crate::attributes::from_fn_attrs(self, func, instance);
+                crate::attributes::from_fn_attrs(self, func, instance, None);
 
                 func
             };
@@ -655,7 +650,8 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
         }
 
         // FIXME directly use the llvm intrinsic adjustment functions here
-        let llret = self.call(fn_ty, None, None, fn_ptr, &call_args, None, None);
+        let llret =
+            self.call(fn_ty, None, None, fn_ptr, ReturnSlot::Direct, &call_args, None, None);
         if is_cleanup {
             self.apply_attrs_to_cleanup_callsite(llret);
         }
@@ -663,22 +659,36 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
         llret
     }
 
-    fn abort(&mut self) {
-        let func = self.context.get_builtin_function("abort");
-        let func: RValue<'gcc> = unsafe { std::mem::transmute(func) };
-        self.call(self.type_void(), None, None, func, &[], None, None);
+    fn abort_immediate(&mut self) {
+        let func = self.context.get_builtin_function("__builtin_trap");
+        self.block.add_eval(self.location, self.context.new_call(self.location, func, &[]));
     }
 
     fn assume(&mut self, value: Self::Value) {
-        // FIXME(antoyo): switch to assume when it exists.
-        // Or use something like this:
-        // #define __assume(cond) do { if (!(cond)) __builtin_unreachable(); } while (0)
-        self.expect(value, true);
+        // libgccjit currently has no direct equivalent of LLVM's `llvm.assume`,
+        // so use the idiom `if (!cond) __builtin_unreachable()`.
+        // FIXME: this should use IFN_ASSUME when we have internal functions in
+        // libgccjit.
+        if self.sess().opts.optimize == OptLevel::No {
+            return;
+        }
+        let then_block = self.append_sibling_block("assume_holds");
+        let unreachable_block = self.append_sibling_block("assume_violated");
+        self.block.end_with_conditional(self.location, value, then_block, unreachable_block);
+
+        self.switch_to_block(unreachable_block);
+        self.unreachable();
+
+        self.switch_to_block(then_block);
     }
 
     fn expect(&mut self, cond: Self::Value, _expected: bool) -> Self::Value {
         // FIXME(antoyo)
         cond
+    }
+
+    fn ctpop(&mut self, val: Self::Value) -> Self::Value {
+        self.pop_count(val)
     }
 
     fn type_checked_load(
@@ -691,8 +701,18 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
         self.context.new_rvalue_from_int(self.int_type, 0)
     }
 
-    fn va_start(&mut self, _va_list: RValue<'gcc>) {
-        unimplemented!();
+    fn va_start(&mut self, va_list: RValue<'gcc>) {
+        let func = self.context.get_builtin_function("__builtin_va_start");
+
+        let va_list_type = self.context.new_c_type(CType::VaList);
+        let va_list = self.context.new_cast(self.location, va_list, va_list_type.make_pointer());
+
+        // Pre-C23 requires that the last "normal" argument was passed to va_start.
+        // Just pass 0, this appears to be handled correctly.
+        let last_normal_arg = self.context.new_rvalue_from_int(self.int_type, 0);
+
+        let call = self.context.new_call(self.location, func, &[va_list, last_normal_arg]);
+        self.block.add_eval(self.location, call);
     }
 
     fn retag_reg(&mut self, _ptr: Self::Value, _info: &RetagInfo<Self::Value>) -> Self::Value {
@@ -813,8 +833,11 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
         idx: &mut usize,
         dst: PlaceRef<'tcx, RValue<'gcc>>,
     ) {
+        let func = bx.current_func();
+        // The return pointer counted by cg_ssa is a hidden parameter in GCC.
+        let hidden_params = bx.functions_with_indirect_return.borrow().contains_key(&func) as usize;
         let mut next = || {
-            let val = bx.current_func().get_param(*idx as i32);
+            let val = func.get_param((*idx - hidden_params) as i32);
             *idx += 1;
             val.to_rvalue()
         };
@@ -823,12 +846,10 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
             PassMode::Pair(..) => {
                 OperandValue::Pair(next(), next()).store(bx, dst);
             }
-            PassMode::Indirect { meta_attrs: Some(_), .. } => {
+            PassMode::IndirectUnsized { .. } => {
                 bug!("unsized `ArgAbi` cannot be stored");
             }
-            PassMode::Direct(_)
-            | PassMode::Indirect { meta_attrs: None, .. }
-            | PassMode::Cast { .. } => {
+            PassMode::Direct(_) | PassMode::Indirect { .. } | PassMode::Cast { .. } => {
                 let next_arg = next();
                 self.store(bx, next_arg, dst);
             }
@@ -950,7 +971,7 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         let else_block = func.new_block("else");
         let after_block = func.new_block("after");
 
-        let result = func.new_local(None, self.u32_type, "zeros");
+        let result = self.new_temp(func, None, self.u32_type);
         let zero = self.cx.gcc_zero(arg.get_type());
         let cond = self.gcc_icmp(IntPredicate::IntEQ, arg, zero);
         self.llbb().end_with_conditional(None, cond, then_block, else_block);
@@ -1031,7 +1052,7 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
             // else call it on the 64 high bits and add 64. In the else case, 64 high bits can't be 0
             // because arg is not 0.
 
-            let result = self.current_func().new_local(None, result_type, "count_zeroes_results");
+            let result = self.new_temp(self.current_func(), None, result_type);
 
             let cz_then_block = self.current_func().new_block("cz_then");
             let cz_else_block = self.current_func().new_block("cz_else");
@@ -1146,8 +1167,8 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         let loop_tail = func.new_block("tail");
 
         let counter_type = self.int_type;
-        let counter = self.current_func().new_local(None, counter_type, "popcount_counter");
-        let val = self.current_func().new_local(None, value_type, "popcount_value");
+        let counter = self.new_temp(self.current_func(), None, counter_type);
+        let val = self.new_temp(self.current_func(), None, value_type);
         let zero = self.gcc_zero(counter_type);
         self.llbb().add_assignment(self.location, counter, zero);
         self.llbb().add_assignment(self.location, val, value);
@@ -1347,12 +1368,12 @@ fn try_intrinsic<'a, 'b, 'gcc, 'tcx>(
         let param_type = bx.u8_type.make_pointer();
         let fn_type =
             bx.context.new_function_pointer_type(None, bx.type_void(), &[param_type], false);
-        bx.call(fn_type, None, None, try_func, &[data], None, None);
+        bx.call(fn_type, None, None, try_func, ReturnSlot::Direct, &[data], None, None);
         // Return 0 unconditionally from the intrinsic call;
         // we can never unwind.
         OperandValue::Immediate(bx.const_bool(false)).store(bx, dest);
     } else {
-        if wants_msvc_seh(bx.sess()) {
+        if wants_msvc_seh(&bx.sess().target) {
             unimplemented!();
         }
         #[cfg(feature = "master")]
@@ -1382,7 +1403,7 @@ fn codegen_gnu_try<'gcc, 'tcx>(
     dest: PlaceRef<'tcx, RValue<'gcc>>,
 ) {
     let cx: &CodegenCx<'gcc, '_> = bx.cx;
-    let (llty, func) = get_rust_try_fn(cx, &mut |mut bx| {
+    let func = get_rust_try_fn(cx, &mut |mut bx| {
         // Codegens the shims described above:
         //
         //   bx:
@@ -1420,21 +1441,41 @@ fn codegen_gnu_try<'gcc, 'tcx>(
         let zero = bx.cx.context.new_rvalue_zero(bx.int_type);
         let ptr = bx.cx.context.new_call(None, eh_pointer_builtin, &[zero]);
         let catch_ty = bx.type_func(&[bx.type_i8p(), bx.type_i8p()], bx.type_void());
-        bx.call(catch_ty, None, None, catch_func, &[data, ptr], None, None);
+        bx.call(catch_ty, None, None, catch_func, ReturnSlot::Direct, &[data, ptr], None, None);
         bx.ret(bx.const_bool(true));
 
         // NOTE: the blocks must be filled before adding the try/catch, otherwise gcc will not
         // generate a try/catch.
         // FIXME(antoyo): add a check in the libgccjit API to prevent this.
         bx.switch_to_block(current_block);
-        bx.invoke(try_func_ty, None, None, try_func, &[data], then, catch, None, None);
+        bx.invoke(
+            try_func_ty,
+            None,
+            None,
+            try_func,
+            ReturnSlot::Direct,
+            &[data],
+            then,
+            catch,
+            None,
+            None,
+        );
     });
 
-    let func = unsafe { std::mem::transmute::<Function<'gcc>, RValue<'gcc>>(func) };
+    let func = func.get_address(None);
 
     // Note that no invoke is used here because by definition this function
     // can't panic (that's what it's catching).
-    let ret = bx.call(llty, None, None, func, &[try_func, data, catch_func], None, None);
+    let ret = bx.call(
+        func.get_type(),
+        None,
+        None,
+        func,
+        ReturnSlot::Direct,
+        &[try_func, data, catch_func],
+        None,
+        None,
+    );
     OperandValue::Immediate(ret).store(bx, dest);
 }
 
@@ -1446,7 +1487,7 @@ fn codegen_gnu_try<'gcc, 'tcx>(
 fn get_rust_try_fn<'a, 'gcc, 'tcx>(
     cx: &'a CodegenCx<'gcc, 'tcx>,
     codegen: &mut dyn FnMut(Builder<'a, 'gcc, 'tcx>),
-) -> (Type<'gcc>, Function<'gcc>) {
+) -> Function<'gcc> {
     if let Some(llfn) = cx.rust_try_fn.get() {
         return llfn;
     }
@@ -1491,9 +1532,8 @@ fn gen_fn<'a, 'gcc, 'tcx>(
     name: &str,
     rust_fn_sig: ty::PolyFnSig<'tcx>,
     codegen: &mut dyn FnMut(Builder<'a, 'gcc, 'tcx>),
-) -> (Type<'gcc>, Function<'gcc>) {
+) -> Function<'gcc> {
     let fn_abi = cx.fn_abi_of_fn_ptr(rust_fn_sig, ty::List::empty());
-    let return_type = fn_abi.gcc_type(cx).return_type;
     // FIXME(eddyb) find a nicer way to do this.
     cx.linkage.set(FunctionType::Internal);
     let func = cx.declare_fn(name, fn_abi);
@@ -1502,5 +1542,5 @@ fn gen_fn<'a, 'gcc, 'tcx>(
     let block = Builder::append_block(cx, func, "entry-block");
     let bx = Builder::build(cx, block);
     codegen(bx);
-    (return_type, func)
+    func
 }

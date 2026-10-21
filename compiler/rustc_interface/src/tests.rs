@@ -21,7 +21,10 @@ use rustc_session::config::{
 };
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib};
-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, build_session, getopts};
+use rustc_session::{
+    CodegenBackendInit, CompilerIO, EarlyDiagCtxt, Session, build_early_session, build_session,
+    getopts,
+};
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::{RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm, sym};
@@ -39,7 +42,7 @@ where
 {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = optgroups().parse(args).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches, true);
     let target = rustc_session::config::build_target_config(
         &early_dcx,
         &sessopts.target_triple,
@@ -66,13 +69,13 @@ where
 
         static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
 
+        let sess = build_early_session(sessopts, target, None);
         let sess = build_session(
-            sessopts,
+            sess,
+            CodegenBackendInit::default(),
             io,
             Default::default(),
-            target,
             "",
-            None,
             &USING_INTERNAL_FEATURES,
         );
         let cfg = parse_cfg(&sess, matches.opt_strs("cfg"));
@@ -636,6 +639,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(debuginfo, DebugInfo::Limited);
     tracked!(dwarf_version, Some(5));
     tracked!(embed_bitcode, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
@@ -816,7 +820,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
-    tracked!(embed_metadata, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(embed_source, true);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
@@ -848,6 +852,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(min_function_alignment, Some(Align::EIGHT));
     tracked!(min_recursion_limit, Some(256));
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
+    tracked!(mir_move_elimination, true);
     tracked!(mir_opt_level, Some(4));
     tracked!(mir_preserve_ub, true);
     tracked!(move_size_limit, Some(4096));
@@ -855,7 +860,7 @@ fn test_unstable_options_tracking_hash() {
     // tidy-alphabetical-end
     // FIXME(#160895): We don't test this when the next-solver is enabled by default.
     if option_env!("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY").is_none() {
-        tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });
+        tracked!(next_solver, NextSolverConfig::Globally);
     }
     // tidy-alphabetical-start
     tracked!(no_generate_arange_section, true);
@@ -938,32 +943,20 @@ fn test_edition_parsing() {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     let matches = optgroups().parse(&["--edition=2018".to_string()]).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches, false);
     assert!(sessopts.edition == Edition::Edition2018)
 }
 
 #[test]
 fn test_assumptions_on_binders_enables_next_solver_globally() {
-    let globally = NextSolverConfig { coherence: true, globally: true };
+    let globally = NextSolverConfig::Globally;
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // `-Zassumptions-on-binders` alone enables the next solver globally.
     let matches = optgroups().parse(&["-Zassumptions-on-binders".to_string()]).unwrap();
-    let opts = build_session_options(&mut early_dcx, &matches);
+    let opts = build_session_options(&mut early_dcx, &matches, false);
     assert!(opts.unstable_opts.assumptions_on_binders);
     assert_eq!(opts.unstable_opts.next_solver, globally);
-
-    // Flag order must not matter when both `-Zassumptions-on-binders` and `-Znext-solver`
-    // are present.
-    for args in [
-        ["-Zassumptions-on-binders".to_string(), "-Znext-solver=coherence".to_string()],
-        ["-Znext-solver=coherence".to_string(), "-Zassumptions-on-binders".to_string()],
-    ] {
-        let matches = optgroups().parse(&args).unwrap();
-        let opts = build_session_options(&mut early_dcx, &matches);
-        assert!(opts.unstable_opts.assumptions_on_binders);
-        assert_eq!(opts.unstable_opts.next_solver, globally);
-    }
 
     // `-Zassumptions-on-binders` overrides `-Znext-solver=no` regardless of order, since
     // the assumptions implementation requires the next solver. This also emits an early
@@ -973,7 +966,7 @@ fn test_assumptions_on_binders_enables_next_solver_globally() {
         ["-Znext-solver=no".to_string(), "-Zassumptions-on-binders".to_string()],
     ] {
         let matches = optgroups().parse(&args).unwrap();
-        let opts = build_session_options(&mut early_dcx, &matches);
+        let opts = build_session_options(&mut early_dcx, &matches, false);
         assert!(opts.unstable_opts.assumptions_on_binders);
         assert_eq!(opts.unstable_opts.next_solver, globally);
     }

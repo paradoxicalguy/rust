@@ -34,7 +34,7 @@ use self::metadata::{
 use self::namespace::mangled_name_of_instance;
 use self::utils::{DIB, create_DIArray, is_node_local_to_unit};
 use crate::builder::Builder;
-use crate::common::{AsCCharPtr, CodegenCx};
+use crate::common::CodegenCx;
 use crate::debuginfo::di_builder::DIBuilderBox;
 use crate::llvm::debuginfo::{
     DIArray, DIFile, DIFlags, DILexicalBlock, DILocation, DISPFlags, DIScope,
@@ -197,9 +197,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             llvm::LLVMRustDIBuilderCreateMethod(
                 DIB(self),
                 containing_scope,
-                name.as_c_char_ptr(),
+                name.as_ptr(),
                 name.len(),
-                linkage_name.as_c_char_ptr(),
+                linkage_name.as_ptr(),
                 linkage_name.len(),
                 file_metadata,
                 loc.line,
@@ -214,9 +214,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             llvm::LLVMRustDIBuilderCreateFunction(
                 DIB(self),
                 containing_scope,
-                name.as_c_char_ptr(),
+                name.as_ptr(),
                 name.len(),
-                linkage_name.as_c_char_ptr(),
+                linkage_name.as_ptr(),
                 linkage_name.len(),
                 file_metadata,
                 loc.line,
@@ -406,12 +406,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         inlined_at: Option<&'ll DILocation>,
         span: Span,
     ) -> &'ll DILocation {
-        // When emitting debugging information, DWARF (i.e. everything but MSVC)
-        // treats line 0 as a magic value meaning that the code could not be
-        // attributed to any line in the source. That's also exactly what dummy
-        // spans are. Make that equivalence here, rather than passing dummy spans
-        // to lookup_debug_loc, which will return line 1 for them.
-        let (line, col) = if span.is_dummy() && !self.sess().target.is_like_msvc {
+        let (line, col) = if span.is_dummy() {
             (0, 0)
         } else {
             let DebugLoc { line, col, .. } = self.lookup_debug_loc(span.lo());
@@ -721,7 +716,7 @@ impl<'ll> CodegenCx<'ll, '_> {
             llvm::LLVMRustDIBuilderCreateTemplateTypeParameter(
                 DIB(self),
                 None,
-                name.as_c_char_ptr(),
+                name.as_ptr(),
                 name.len(),
                 actual_type_metadata,
             )

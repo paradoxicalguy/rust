@@ -41,6 +41,11 @@ const GATED_CFGS: &[GatedCfg] = &[
         Features::cfg_target_has_reliable_f16_f128,
     ),
     (
+        sym::target_has_reliable_f16b,
+        sym::cfg_target_has_reliable_f16b,
+        Features::cfg_target_has_reliable_f16b,
+    ),
+    (
         sym::target_has_reliable_f128,
         sym::cfg_target_has_reliable_f16_f128,
         Features::cfg_target_has_reliable_f16_f128,
@@ -156,6 +161,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::force_target_feature,
     sym::sanitize,
     sym::coverage,
+    sym::optimize,
 
     sym::doc,
 
@@ -179,8 +185,6 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::marker,
     sym::thread_local,
     sym::no_core,
-    // RFC 2412
-    sym::optimize,
 
     sym::ffi_pure,
     sym::ffi_const,
@@ -316,11 +320,13 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     // types (as well as any others in future).
     sym::rustc_lint_opt_deny_field_access,
     sym::rustc_diagnostic_opaque,
+    sym::rustc_assert_variance,
 
     // ==========================================================================
     // Internal attributes, Const related:
     // ==========================================================================
 
+    sym::rustc_always_gca,
     sym::rustc_promotable,
     sym::rustc_legacy_const_generics,
     // Do not const-check this function's body. It will always get replaced during CTFE via `hook_special_const_fn`.
@@ -379,6 +385,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     // Internal attributes, Testing:
     // ==========================================================================
 
+    sym::rustc_show_spans,
     sym::rustc_effective_visibility,
     sym::rustc_dump_inferred_outlives,
     sym::rustc_capture_analysis,

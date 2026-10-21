@@ -8,7 +8,7 @@ use rustc_type_ir::lang_items::{SolverProjectionLangItem, SolverTraitLangItem};
 use rustc_type_ir::solve::SizedTraitKind;
 use rustc_type_ir::solve::inspect::ProbeKind;
 use rustc_type_ir::{
-    self as ty, Binder, FallibleTypeFolder, Interner, Movability, Mutability, Region, TypeFoldable,
+    self as ty, FallibleTypeFolder, Interner, Movability, Mutability, Region, TypeFoldable,
     TypeSuperFoldable, Unnormalized, Upcast as _, elaborate,
 };
 use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
@@ -60,7 +60,8 @@ where
         | ty::Placeholder(..)
         | ty::Alias(ty::IsRigid::No, _)
         | ty::Bound(..)
-        | ty::Infer(_) => {
+        | ty::Infer(_)
+        | ty::Alias(ty::IsRigid::Yes, ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
             panic!("unexpected type `{ty:?}`")
         }
 
@@ -106,15 +107,6 @@ where
                 .map(Unnormalized::skip_norm_wip)
                 .collect(),
         )),
-
-        ty::Alias(ty::IsRigid::Yes, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
-            // We can resolve the `impl Trait` to its concrete type,
-            // which enforces a DAG between the functions requiring
-            // the auto trait bounds in question.
-            Ok(ty::Binder::dummy(vec![
-                cx.type_of(def_id.into()).instantiate(cx, args).skip_norm_wip(),
-            ]))
-        }
     }
 }
 
@@ -448,6 +440,10 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_async_callable<I: 
 ) -> Result<(ty::Binder<I, AsyncCallableRelevantTypes<I>>, Vec<I::Predicate>), NoSolution> {
     match self_ty.kind() {
         ty::CoroutineClosure(def_id, args) => {
+            if !cx.coroutine_is_async(cx.coroutine_for_closure(def_id)) {
+                return Err(NoSolution);
+            }
+
             let args = args.as_coroutine_closure();
             let kind_ty = args.kind_ty();
             let sig = args.coroutine_closure_sig().skip_binder();
@@ -891,7 +887,7 @@ pub(in crate::solve) fn const_conditions_for_destruct<I: Interner>(
 pub(in crate::solve) fn predicates_for_object_candidate<D, I>(
     ecx: &mut EvalCtxt<'_, D>,
     param_env: I::ParamEnv,
-    trait_ref: Binder<I, ty::TraitRef<I>>,
+    trait_ref: ty::TraitRef<I>,
     object_bounds: I::BoundExistentialPredicates,
 ) -> Result<Vec<Goal<I, I::Predicate>>, AmbiguousOrRerunNonErased>
 where
@@ -899,7 +895,6 @@ where
     I: Interner,
 {
     let cx = ecx.cx();
-    let trait_ref = ecx.instantiate_binder_with_infer(trait_ref);
     let mut requirements = vec![];
     // Elaborating all supertrait outlives obligations here is not soundness critical,
     // since if we just used the unelaborated set, then the transitive supertraits would

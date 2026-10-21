@@ -1925,7 +1925,11 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_expr(Expr::OffsetOf(OffsetOf { container, fields }), syntax_ptr)
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
-            ast::Expr::IncludeBytesExpr(_) => self.alloc_expr(Expr::IncludeBytes, syntax_ptr)
+            ast::Expr::IncludeBytesExpr(_) => self.alloc_expr(Expr::IncludeBytes, syntax_ptr),
+            ast::Expr::CfgPredExpr(e) => {
+                let enabled = Expr::Literal(Literal::Bool(self.check_cfg_pred(e.cfg_predicate())));
+                self.alloc_expr(enabled, syntax_ptr)
+            },
         })
     }
 
@@ -3082,15 +3086,11 @@ impl<'db> ExprCollector<'db> {
                 Pat::Deref { inner }
             }
             ast::Pat::NotNull(_) => Pat::NotNull,
-            ast::Pat::ConstBlockPat(const_block_pat) => {
-                if let Some(block) = const_block_pat.block_expr() {
-                    let expr_id = self.with_label_rib(RibKind::Constant, |this| {
-                        this.with_binding_owner(|this| this.collect_block(block))
-                    });
-                    Pat::ConstBlock(expr_id)
-                } else {
-                    Pat::Missing
-                }
+            ast::Pat::ConstBlockPat(_) => Pat::Missing,
+            ast::Pat::CfgPredPat(p) => {
+                let enabled = Expr::Literal(Literal::Bool(self.check_cfg_pred(p.cfg_predicate())));
+                let expr_id = self.alloc_expr_from_pat(enabled, AstPtr::new(&pat));
+                Pat::Lit(expr_id)
             }
             ast::Pat::MacroPat(mac) => {
                 return self.collect_macro_pat_with(mac.clone(), |this, expanded_pat| {
@@ -3277,16 +3277,6 @@ impl<'db> ExprCollector<'db> {
                 let Some((literal, _)) = pat_literal_to_hir(it) else { return self.missing_expr() };
                 self.alloc_expr_from_pat(Expr::Literal(literal), ptr)
             }
-            ast::Pat::ConstBlockPat(it) => {
-                if let Some(block) = it.block_expr() {
-                    let expr_id = self.with_label_rib(RibKind::Constant, |this| {
-                        this.with_binding_owner(|this| this.collect_block(block))
-                    });
-                    self.alloc_expr_from_pat(Expr::Const(expr_id), ptr)
-                } else {
-                    self.missing_expr()
-                }
-            }
             ast::Pat::PathPat(it) => {
                 let path = it
                     .path()
@@ -3344,6 +3334,12 @@ impl<'db> ExprCollector<'db> {
                 false
             }
         }
+    }
+
+    /// Used for `cfg!()`, conducting imprecise checks
+    fn check_cfg_pred(&self, pred: Option<ast::CfgPredicate>) -> bool {
+        let expr = pred.map_or(cfg::CfgExpr::Invalid, cfg::CfgExpr::parse_from_ast);
+        self.cfg_options.check(&expr) != Some(false)
     }
 
     fn add_definition_to_binding(&mut self, binding_id: BindingId, pat_id: PatId) {

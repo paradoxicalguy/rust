@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use rustc_data_structures::intern::Interned;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, extension};
+use rustc_span::bug;
 use rustc_type_ir as ir;
 
 use crate::ty::{self, EarlyBinder, Ty, TyCtxt, TypeFlags, Upcast, UpcastFrom, WithCachedTypeInfo};
@@ -170,9 +171,17 @@ impl<'tcx> Clause<'tcx> {
     }
 
     pub fn kind(self) -> ty::Binder<'tcx, ClauseKind<'tcx>> {
-        self.0.internee.map_bound(|kind| match kind {
+        // Outline the unreachable! call to make the happy path faster.
+        // see: https://github.com/rust-lang/rust/pull/163657#issuecomment-5956974964
+        #[cold]
+        #[inline(never)]
+        fn unreachable_inner() -> ! {
+            unreachable!()
+        }
+
+        self.0.internee.map_bound_no_validate_bound_vars(|kind| match kind {
             PredicateKind::Clause(clause) => clause,
-            _ => unreachable!(),
+            _ => unreachable_inner(),
         })
     }
 
@@ -519,7 +528,8 @@ impl<'tcx> UpcastFrom<TyCtxt<'tcx>, TraitClause<'tcx>> for Predicate<'tcx> {
 
 impl<'tcx> UpcastFrom<TyCtxt<'tcx>, PolyTraitClause<'tcx>> for Predicate<'tcx> {
     fn upcast_from(from: PolyTraitClause<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
-        from.map_bound(|p| PredicateKind::Clause(ClauseKind::Trait(p))).upcast(tcx)
+        from.map_bound_no_validate_bound_vars(|p| PredicateKind::Clause(ClauseKind::Trait(p)))
+            .upcast(tcx)
     }
 }
 

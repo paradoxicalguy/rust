@@ -5,7 +5,7 @@ use std::ops::Range;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet, StdEntry};
 use rustc_index::IndexVec;
-use rustc_index::bit_set::DenseBitSet;
+use rustc_index::bit_set::GrowableBitSet;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
@@ -210,17 +210,6 @@ impl<V: Clone + HasBottom> State<V> {
     {
         self.flood(target, map);
         if let Some(target) = map.find(target) {
-            self.insert_idx(target, result, map);
-        }
-    }
-
-    /// Helper method for assignments to a discriminant.
-    pub fn assign_discr(&mut self, target: PlaceRef<'_>, result: ValueOrPlace<V>, map: &Map<'_>)
-    where
-        V: HasTop,
-    {
-        self.flood_discr(target, map);
-        if let Some(target) = map.find_discr(target) {
             self.insert_idx(target, result, map);
         }
     }
@@ -797,6 +786,12 @@ impl<'tcx> Map<'tcx> {
         };
         let elems = place.projection.iter().map(|&elem| elem.try_into()).chain(tail_elem.map(Ok));
         for elem in elems {
+            // All fields of a union alias each other.
+            if self.places[index].ty.is_union() {
+                self.for_each_value_inside(index, f);
+                return;
+            }
+
             // A field aliases the parent place.
             if let Some(vi) = self.places[index].value_index {
                 f(vi);
@@ -1039,9 +1034,9 @@ pub fn iter_fields<'tcx>(
 }
 
 /// Returns all locals with projections that have their reference or address taken.
-pub fn excluded_locals(body: &Body<'_>) -> DenseBitSet<Local> {
+pub fn excluded_locals(body: &Body<'_>) -> GrowableBitSet<Local> {
     struct Collector {
-        result: DenseBitSet<Local>,
+        result: GrowableBitSet<Local>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector {
@@ -1054,7 +1049,7 @@ pub fn excluded_locals(body: &Body<'_>) -> DenseBitSet<Local> {
         }
     }
 
-    let mut collector = Collector { result: DenseBitSet::new_empty(body.local_decls.len()) };
+    let mut collector = Collector { result: GrowableBitSet::new_empty() };
     collector.visit_body(body);
     collector.result
 }

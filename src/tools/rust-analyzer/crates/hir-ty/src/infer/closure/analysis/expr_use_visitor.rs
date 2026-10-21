@@ -13,6 +13,7 @@ use hir_def::{
         PatId, RecordLitField, RecordSpread, Statement,
     },
     resolver::ValueNs,
+    upvars::UpvarsRef,
 };
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
@@ -29,7 +30,6 @@ use crate::{
     },
     method_resolution::CandidateId,
     next_solver::{ErrorGuaranteed, StoredTy, Ty, TyKind},
-    upvars::UpvarsRef,
     utils::EnumerateAndAdjustIterator,
 };
 
@@ -976,7 +976,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                         read_discriminant(this);
                     }
                 }
-                Pat::Lit(_) | Pat::ConstBlock(_) | Pat::Range { .. } => {
+                Pat::Lit(_) | Pat::Range { .. } => {
                     // When matching against a literal or range, we need to
                     // borrow the place to compare it against the pattern.
                     //
@@ -1690,7 +1690,6 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
             | Pat::Expr(..)
             | Pat::Path(_)
             | Pat::Lit(..)
-            | Pat::ConstBlock(..)
             | Pat::Range { .. }
             | Pat::Missing
             | Pat::Rest

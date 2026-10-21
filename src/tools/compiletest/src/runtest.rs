@@ -260,6 +260,28 @@ enum CompilerKind {
     Rustdoc,
 }
 
+/// Unstable compiler flags that compiletest passes to UI tests on its own, i.e. without specific
+/// tests opting into them explicitly.
+/// This should include both flags that are always passed unconditionally (e.g. `-Zui-testing`) and
+/// flags that are enabled across the whole test suite when compiletest is configured in a
+/// certain way (e.g. a specific `-Zcodegen-backend` being used for all tests).
+///
+/// Note: try to keep this up-to-date with [`TestCx::make_compile_args`].
+pub(crate) const COMPILETEST_UI_SUITE_UNSTABLE_FLAGS: &[&str] = &[
+    "simulate-remapped-rust-src-base",
+    "translate-remapped-path-to-local-path",
+    "ignore-directory-in-diagnostics-source-blocks",
+    "deduplicate-diagnostics",
+    "write-long-types-to-disk",
+    "codegen-backend",
+    "next-solver",
+    "polonius",
+    "wasm-proc-macros",
+    "threads",
+    "ui-testing",
+    "unstable-options",
+];
+
 impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
     /// revisions, exactly once, with revision == None).
@@ -1047,14 +1069,21 @@ impl<'test> TestCx<'test> {
             .args(&self.props.doc_flags);
 
         match kind {
-            DocKind::Html => {}
+            DocKind::Html => {
+                if self.props.use_rustdoc_cci_doc_meta_merge {
+                    rustdoc.arg("--write-doc-meta-dir").arg(out_dir.as_ref().join("doc.meta"));
+                }
+            }
             DocKind::Json => {
                 rustdoc.arg("--output-format").arg("json");
             }
         }
 
         // Both JSON output and `--disable-minification` are unstable rustdoc options.
-        if matches!(kind, DocKind::Json) || self.config.disable_minification {
+        if matches!(kind, DocKind::Json)
+            || self.config.disable_minification
+            || self.props.use_rustdoc_cci_doc_meta_merge
+        {
             rustdoc.arg("-Zunstable-options");
         }
         if self.config.disable_minification {
@@ -1065,7 +1094,31 @@ impl<'test> TestCx<'test> {
             rustdoc.arg(format!("-Clinker={}", linker));
         }
 
-        self.compose_and_run_compiler(rustdoc, None)
+        let docres = self.compose_and_run_compiler(rustdoc, None);
+        if !docres.status.success() {
+            return docres;
+        }
+        if kind == DocKind::Html && self.props.use_rustdoc_cci_doc_meta_merge {
+            let mut rustdoc_merge = Command::new(rustdoc_path);
+            let current_dir = self.output_base_dir();
+            rustdoc_merge.current_dir(current_dir);
+            rustdoc_merge
+                .arg("-o")
+                .arg(out_dir.as_ref())
+                .args(&self.props.compile_flags)
+                .args(&self.props.doc_flags)
+                .arg("--read-doc-meta-dir")
+                .arg(out_dir.as_ref().join("doc.meta"))
+                .arg("-Zunstable-options");
+            if self.config.disable_minification {
+                rustdoc_merge.arg("--disable-minification");
+            }
+            let docmerge = self.compose_and_run_compiler(rustdoc_merge, None);
+            if !docmerge.status.success() {
+                return docmerge;
+            }
+        }
+        docres
     }
 
     fn exec_compiled_test(&self) -> ProcRes {
@@ -1342,6 +1395,7 @@ impl<'test> TestCx<'test> {
 
         rustc.args(&["--crate-type", "rlib"]);
         rustc.arg("-Cpanic=abort");
+        rustc.arg("--check-cfg=cfg(target_has_reliable_f16b)");
         rustc.args(self.props.minicore_compile_flags.clone());
 
         let res =
@@ -1573,7 +1627,8 @@ impl<'test> TestCx<'test> {
             // Exhaustively match all other suites.
             // Note that some suites never actually use this method, so the
             // return value for those suites is not necessarily meaningful.
-            TestSuite::AssemblyLlvm
+            TestSuite::AssemblyGcc
+            | TestSuite::AssemblyLlvm
             | TestSuite::BuildStd
             | TestSuite::CodegenLlvm
             | TestSuite::CodegenUnits
@@ -1627,6 +1682,9 @@ impl<'test> TestCx<'test> {
         {
             compiler.arg("-Zunstable-options").arg("--disable-minification");
         }
+
+        // Note: when adding new unstable compile flags here, also update
+        // `COMPILETEST_UI_SUITE_UNSTABLE_FLAGS`
 
         // Hide libstd sources from ui tests to make sure we generate the stderr
         // output that users will see.
@@ -1910,9 +1968,6 @@ impl<'test> TestCx<'test> {
             }
             Some(CompareMode::NextSolver) => {
                 compiler.args(&["-Znext-solver"]);
-            }
-            Some(CompareMode::NextSolverCoherence) => {
-                compiler.args(&["-Znext-solver=coherence"]);
             }
             Some(CompareMode::SplitDwarf) if self.config.target.contains("windows") => {
                 compiler.args(&["-Csplit-debuginfo=unpacked", "-Zunstable-options"]);

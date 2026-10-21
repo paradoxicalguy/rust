@@ -5,8 +5,9 @@ use clippy_utils::source::{IntoSpan as _, SpanExt as _};
 use clippy_utils::visitors::for_each_expr_without_closures;
 use clippy_utils::{LimitStack, get_async_fn_body, sym};
 use core::ops::ControlFlow;
+use rustc_attr_ir::Attribute;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{Attribute, Body, Expr, ExprKind, FnDecl};
+use rustc_hir::{Body, Expr, ExprKind, FnDecl};
 use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
@@ -30,8 +31,8 @@ declare_clippy_lint! {
     ///
     /// ### Lints to consider instead of this
     ///
-    /// * [`excessive_nesting`](https://rust-lang.github.io/rust-clippy/master/index.html#excessive_nesting)
-    /// * [`too_many_lines`](https://rust-lang.github.io/rust-clippy/master/index.html#too_many_lines)
+    /// * [`excessive_nesting`](https://rust-lang.github.io/rust-clippy/main/index.html#excessive_nesting)
+    /// * [`too_many_lines`](https://rust-lang.github.io/rust-clippy/main/index.html#too_many_lines)
     #[clippy::version = "1.35.0"]
     pub COGNITIVE_COMPLEXITY,
     restriction,

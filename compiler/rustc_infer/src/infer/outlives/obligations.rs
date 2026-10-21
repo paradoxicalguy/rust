@@ -61,14 +61,13 @@
 
 use rustc_data_structures::transitive_relation::{TransitiveRelation, TransitiveRelationBuilder};
 use rustc_data_structures::undo_log::UndoLogs;
-use rustc_middle::bug;
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::ty::outlives::{Component, push_outlives_components};
 use rustc_middle::ty::{
     self, GenericArgKind, GenericArgsRef, PolyTypeOutlivesClause, Region, RegionVid, Ty, TyCtxt,
-    TypeVisitableExt, Upcast, eager_resolve_vars,
+    TypeVisitableExt, Upcast,
 };
-use rustc_span::Span;
+use rustc_span::bug;
 use rustc_type_ir::region_constraint::{self, LeafRegionConstraint};
 use smallvec::smallvec;
 use tracing::{debug, instrument};
@@ -142,19 +141,7 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 
     pub fn register_solver_region_constraint(&self, c: SolverRegionConstraint<'tcx>) {
-        let mut inner = self.inner.borrow_mut();
-
-        let old_constraint = inner.solver_region_constraint_storage.get_constraint();
-        let new_constraint = rustc_type_ir::region_constraint::RegionConstraint::build_and(
-            c,
-            old_constraint.clone(),
-        );
-
-        // FIXME(-Zassumptions-on-binders): This is pretty bad for perf, we don't make incremental
-        // changes to the region constraints, instead we just rewrite the entire thing every time
-        // and store the old version.
-        inner.undo_log.push(UndoLog::OverwriteSolverRegionConstraint { old_constraint });
-        inner.solver_region_constraint_storage.overwrite(new_constraint);
+        self.inner.borrow_mut().unwrap_region_constraints().register_solver_constraint(c);
     }
 
     pub fn register_type_outlives_constraint(
@@ -280,15 +267,13 @@ impl<'tcx> InferCtxt<'tcx> {
         assert!(self.tcx.assumptions_on_binders());
         assert!(self.next_trait_solver());
 
-        let constraint = self.inner.borrow().solver_region_constraint_storage.get_constraint();
+        let constraint = self.get_solver_region_constraint();
         debug!(?constraint);
         let constraint = region_constraint::destructure_type_outlives_constraints_in_root(
             self,
             constraint,
             &assumptions,
         );
-        debug!(?constraint);
-        let constraint = region_constraint::propagate_ambiguity(constraint);
         debug!(?constraint);
 
         // FIXME(-Zassumptions-on-binders): actually implement OR as an  OR
@@ -335,11 +320,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// invoked after all type-inference variables have been bound --
     /// right before lexical region resolution.
     #[instrument(level = "debug", skip(self, outlives_env))]
-    pub fn process_registered_region_obligations(
-        &self,
-        outlives_env: &OutlivesEnvironment<'tcx>,
-        span: Span,
-    ) {
+    pub fn process_registered_region_obligations(&self, outlives_env: &OutlivesEnvironment<'tcx>) {
         assert!(!self.in_snapshot(), "cannot process registered region obligations in a snapshot");
 
         if self.tcx.assumptions_on_binders() {
@@ -366,7 +347,12 @@ impl<'tcx> InferCtxt<'tcx> {
                 // `TypeOutlives` is structural, so we should try to opportunistically resolve all
                 // region vids before processing regions, so we have a better chance to match clauses
                 // in our param-env.
-                let (sup_type, sub_region) = eager_resolve_vars(self, (sup_type, sub_region));
+                //
+                // We *want* this folder to live in `rustc_type_ir`. Our best way to call into it is
+                // through `InferCtxtLike` and it is not defined as an inherent method on `InferCtxt`.
+                #[allow(rustc::usage_of_type_ir_traits)]
+                let (sup_type, sub_region) =
+                    self.deeply_resolve_via_unification_table((sup_type, sub_region));
 
                 if self.tcx.sess.opts.unstable_opts.higher_ranked_assumptions
                     && outlives_env

@@ -26,7 +26,6 @@ use rustc_lint_defs::builtin::{LINKER_INFO, LINKER_MESSAGES};
 use rustc_macros::Diagnostic;
 use rustc_metadata::EncodedMetadata;
 use rustc_metadata::fs::{METADATA_FILENAME, copy_to_stdout, emit_wrapper_file};
-use rustc_middle::bug;
 use rustc_middle::diagnostics::DuplicateEiiImpls;
 use rustc_middle::lint::emit_lint_base;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
@@ -41,11 +40,11 @@ use rustc_session::search_paths::PathKind;
 /// For all the linkers we support, and information they might
 /// need out of the shared crate context before we get rid of it.
 use rustc_session::{Session, filesearch};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, bug};
 use rustc_structures::{CrateType, NativeLibKind};
 use rustc_target::spec::crt_objects::CrtObjects;
 use rustc_target::spec::{
-    Arch, BinaryFormat, Cc, CfgAbi, Env, LinkOutputKind, LinkSelfContainedComponents,
+    BinaryFormat, Cc, CfgAbi, Env, LinkOutputKind, LinkSelfContainedComponents,
     LinkSelfContainedDefault, LinkerFeatures, LinkerFlavor, LinkerFlavorCli, Lld, Os, RelocModel,
     RelroLevel, SanitizerSet, SplitDebuginfo,
 };
@@ -59,7 +58,7 @@ use super::linker::{self, Linker};
 use super::metadata::{MetadataPosition, create_wrapper_file};
 use super::rmeta_link::RmetaLinkCache;
 use super::rpath::{self, RPathConfig};
-use super::{apple, rmeta_link, versioned_llvm_target};
+use super::{apple, rmeta_link, symbol_export, versioned_llvm_target};
 use crate::base::needs_allocator_shim_for_linking;
 use crate::{
     CodegenLintLevelSpecs, CompiledModule, CompiledModules, CrateInfo, NativeLib, SymbolExport,
@@ -835,24 +834,33 @@ fn link_staticlib(
     let hide = sess.opts.unstable_opts.staticlib_hide_internal_symbols;
     let rename = sess.opts.unstable_opts.staticlib_rename_internal_symbols;
 
+    let hide_supported =
+        matches!(sess.target.binary_format, BinaryFormat::Elf | BinaryFormat::MachO);
+    // Rename only rewrites symbol names, so it also works on COFF; hide
+    // needs a visibility concept COFF lacks.
+    let rename_supported = matches!(
+        sess.target.binary_format,
+        BinaryFormat::Elf | BinaryFormat::MachO | BinaryFormat::Coff
+    );
+
     let exported_symbols = if hide || rename {
-        if !matches!(sess.target.binary_format, BinaryFormat::Elf | BinaryFormat::MachO) {
-            if hide {
-                sess.dcx().emit_warn(diagnostics::StaticlibHideInternalSymbolsUnsupported {
-                    binary_format: sess.target.archive_format.to_string(),
-                });
-            }
-            if rename {
-                sess.dcx().emit_warn(diagnostics::StaticlibRenameInternalSymbolsUnsupported {
-                    binary_format: sess.target.archive_format.to_string(),
-                });
-            }
-            None
-        } else {
+        if hide && !hide_supported {
+            sess.dcx().emit_warn(diagnostics::StaticlibHideInternalSymbolsUnsupported {
+                binary_format: sess.target.archive_format.to_string(),
+            });
+        }
+        if rename && !rename_supported {
+            sess.dcx().emit_warn(diagnostics::StaticlibRenameInternalSymbolsUnsupported {
+                binary_format: sess.target.archive_format.to_string(),
+            });
+        }
+        if (hide && hide_supported) || (rename && rename_supported) {
             crate_info
                 .exported_symbols
                 .get(&CrateType::StaticLib)
                 .map(|symbols| symbols.iter().map(|symbol| symbol.name.clone()).collect())
+        } else {
+            None
         }
     } else {
         None
@@ -860,8 +868,11 @@ fn link_staticlib(
 
     let symbols = exported_symbols.map(|exported| ArchiveSymbols {
         exported,
-        rename_suffix: rename.then(|| crate_info.symbol_rename_suffix.clone()),
-        hide,
+        rename_suffix: (rename && rename_supported)
+            .then(|| crate_info.symbol_rename_suffix.clone()),
+        // A warning was already emitted above if hiding was requested for an
+        // unsupported format; don't also ask the backend to hide there.
+        hide: hide && hide_supported,
     });
 
     ab.build(out_filename, symbols);
@@ -1338,17 +1349,25 @@ fn link_natively(
             continue;
         }
 
-        // Detect '-static-pie' used with an older version of gcc or clang not supporting it.
-        // Fallback from '-static-pie' to '-static' in that case.
+        // Detect '-static-pie' used with an older version of gcc or clang not supporting it,
+        // or with glibc that's missing crt objects, e.g. for arches that don't support it.
+        // Fallback from '-static-pie' to '-static' in either case.
+        let mut static_pie_message = None;
         if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, _))
-            && unknown_arg_regex.is_match(&out)
-            && (out.contains("-static-pie") || out.contains("--no-dynamic-linker"))
             && cmd.get_args().iter().any(|e| e == "-static-pie")
         {
+            if unknown_arg_regex.is_match(&out)
+                && (out.contains("-static-pie") || out.contains("--no-dynamic-linker"))
+            {
+                static_pie_message =
+                    Some("Linker does not support -static-pie command line option.");
+            } else if Regex::new(r"cannot (find|open) g?rcrt1\.o:").unwrap().is_match(&out) {
+                static_pie_message = Some("C library is missing static-PIE startup objects.");
+            }
+        }
+        if let Some(message) = static_pie_message {
             info!("linker output: {:?}", out);
-            warn!(
-                "Linker does not support -static-pie command line option. Retrying with -static instead."
-            );
+            warn!("{message} Retrying with -static instead.");
             // Mirror `add_(pre,post)_link_objects` to replace CRT objects.
             let self_contained_crt_objects = self_contained_components.is_crt_objects_enabled();
             let opts = &sess.target;
@@ -1765,7 +1784,11 @@ fn add_sanitizer_libraries(
         && (sess.opts.unstable_opts.sanitizer_cfi_diag.unwrap_or(false)
             || sess.opts.unstable_opts.sanitizer_cfi_recover.unwrap_or(false))
     {
-        link_sanitizer_runtime(sess, flavor, linker, "ubsan");
+        if sess.is_sanitizer_cfi_minimal_runtime_enabled() {
+            link_sanitizer_runtime(sess, flavor, linker, "ubsan_minimal");
+        } else {
+            link_sanitizer_runtime(sess, flavor, linker, "ubsan");
+        }
     }
 }
 
@@ -2744,10 +2767,6 @@ fn add_rpath_args(
     }
 }
 
-fn strip_numeric_suffix<'a>(base: &'a str, suffix: impl AsRef<str>, fallback: &'a str) -> &'a str {
-    if suffix.as_ref().parse::<u32>().is_ok() { base } else { fallback }
-}
-
 fn undecorate_c_symbol<'a>(
     name: &'a str,
     sess: &Session,
@@ -2760,47 +2779,11 @@ fn undecorate_c_symbol<'a>(
             name.strip_prefix('_')
         }
         BinaryFormat::Coff => {
-            // MSVC C++ mangled names start with '?' and use a completely different
-            // decorating scheme that includes '@@' as structural delimiters.
-            // They must not be subjected to C calling-convention undecoration.
-            if name.starts_with('?') {
-                return Some(name);
+            // COFF undecoration is shared with `symbol_edit`'s binary-level matching.
+            match symbol_export::coff_machine_for_arch(&sess.target.arch) {
+                Some(machine) => Some(symbol_export::undecorate_coff_symbol(name, machine, kind)),
+                None => Some(name),
             }
-            Some(match sess.target.arch {
-                Arch::X86 => {
-                    // COFF 32-bit: strip calling-convention decorations.
-                    if let Some(rest) = name.strip_prefix('@') {
-                        // fastcall: @foo@N -> foo
-                        rest.rsplit_once('@')
-                            .map(|(base, suffix)| strip_numeric_suffix(base, suffix, name))
-                            .unwrap_or(name)
-                    } else if let Some(stripped) = name.strip_prefix('_') {
-                        if let Some((base, suffix)) = stripped.rsplit_once('@') {
-                            // stdcall: _foo@N -> foo
-                            strip_numeric_suffix(base, suffix, stripped)
-                        } else {
-                            // cdecl: _foo -> foo
-                            stripped
-                        }
-                    } else {
-                        // vectorcall: foo@@N -> foo
-                        name.rsplit_once("@@")
-                            .map(|(base, suffix)| strip_numeric_suffix(base, suffix, name))
-                            .unwrap_or(name)
-                    }
-                }
-                Arch::X86_64 => {
-                    // COFF 64-bit: vectorcall mangling (foo@@N -> foo) also applies on x86_64.
-                    name.rsplit_once("@@")
-                        .map(|(base, suffix)| strip_numeric_suffix(base, suffix, name))
-                        .unwrap_or(name)
-                }
-                Arch::Arm64EC if kind == SymbolExportKind::Text => {
-                    // Arm64EC: `#` prefix distinguishes ARM64EC text symbols from x64 thunks.
-                    name.strip_prefix('#').unwrap_or(name)
-                }
-                _ => name,
-            })
         }
         // ELF: no decoration
         _ => Some(name),

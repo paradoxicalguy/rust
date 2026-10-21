@@ -22,7 +22,6 @@ use rustc_lint_defs::{
     FutureIncompatibleInfo, Lint, LintExpectationId, LintId, StableLintExpectationId,
     UnstableLintExpectationId,
 };
-use rustc_middle::bug;
 use rustc_middle::lint::{LevelSpec, StableLevelSpec, UnstableLevelSpec};
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
@@ -32,7 +31,7 @@ use rustc_middle::ty::{
 };
 use rustc_session::{DynLintStore, Session};
 use rustc_span::edit_distance::find_best_match_for_names;
-use rustc_span::{Ident, Span, Symbol, sym};
+use rustc_span::{Ident, Span, Symbol, bug, sym};
 use tracing::debug;
 
 use self::TargetLint::*;
@@ -358,14 +357,14 @@ impl LintStore {
         }
 
         let complete_name = if let Some(tool_name) = tool_name {
-            format!("{tool_name}::{lint_name}")
+            &format!("{tool_name}::{lint_name}")
         } else {
-            lint_name.to_string()
+            lint_name
         };
         // If the lint was scoped with `tool::` check if the tool lint exists
         if let Some(tool_name) = tool_name {
-            match self.by_name.get(&complete_name) {
-                None => match self.lint_groups.get(&*complete_name) {
+            match self.by_name.get(complete_name) {
+                None => match self.lint_groups.get(complete_name) {
                     // If the lint isn't registered, there are two possibilities:
                     None => {
                         // 1. The tool is currently running, so this lint really doesn't exist.
@@ -374,7 +373,7 @@ impl LintStore {
                         let tool_prefix = format!("{tool_name}::");
 
                         return if self.by_name.keys().any(|lint| lint.starts_with(&tool_prefix)) {
-                            self.no_lint_suggestion(&complete_name, tool_name.as_str())
+                            self.no_lint_suggestion(complete_name, tool_name.as_str())
                         } else {
                             // 2. The tool isn't currently running, so no lints will be registered.
                             // To avoid giving a false positive, ignore all unknown lints.
@@ -395,13 +394,13 @@ impl LintStore {
                 _ => {}
             }
         }
-        match self.by_name.get(&complete_name) {
+        match self.by_name.get(complete_name) {
             Some(Renamed(new_name, _)) => CheckLintNameResult::Renamed(new_name.to_string()),
             Some(Removed(reason)) => CheckLintNameResult::Removed(reason.to_string()),
-            None => match self.lint_groups.get(&*complete_name) {
+            None => match self.lint_groups.get(complete_name) {
                 // If neither the lint, nor the lint group exists check if there is a `clippy::`
                 // variant of this lint
-                None => self.check_tool_name_for_backwards_compat(&complete_name, "clippy"),
+                None => self.check_tool_name_for_backwards_compat(complete_name, "clippy"),
                 Some(LintGroup { lint_ids, depr, .. }) => {
                     // Check if the lint group name is deprecated
                     if let &Some(LintAlias { name, silent: false }) = depr {
@@ -522,7 +521,7 @@ pub trait LintContext {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a> Diagnostic<'a, ()>,
+        decorate: impl for<'a> Diagnostic<'a>,
     );
 
     /// Emit a lint at `span` from a lint struct (some type that implements `Diagnostic`,
@@ -532,7 +531,7 @@ pub trait LintContext {
         &self,
         lint: &'static Lint,
         span: S,
-        decorator: impl for<'a> Diagnostic<'a, ()>,
+        decorator: impl for<'a> Diagnostic<'a>,
     ) {
         self.opt_span_lint(lint, Some(span), decorator);
     }
@@ -548,17 +547,7 @@ pub trait LintContext {
     /// retrieved from the current lint pass. Buffered or manually created ids can
     /// cause ICEs.
     fn fulfill_expectation(&self, expectation: Self::LintExpectationId) {
-        // We need to make sure that submitted expectation ids are correctly fulfilled suppressed
-        // and stored between compilation sessions. To not manually do these steps, we simply create
-        // a dummy diagnostic and emit it as usual, which will be suppressed and stored like a
-        // normal expected lint diagnostic.
-        self.sess()
-            .dcx()
-            .struct_expect(
-                "this is a dummy diagnostic, to submit and store an expectation",
-                expectation.into(),
-            )
-            .emit();
+        self.sess().dcx().fulfill_expectation(expectation);
     }
 }
 
@@ -596,7 +585,7 @@ impl<'tcx> LintContext for LateContext<'tcx> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a> Diagnostic<'a, ()>,
+        decorate: impl for<'a> Diagnostic<'a>,
     ) {
         let hir_id = self.last_node_with_lint_attrs;
 
@@ -623,7 +612,7 @@ impl LintContext for EarlyContext<'_> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorator: impl for<'a> Diagnostic<'a, ()>,
+        decorator: impl for<'a> Diagnostic<'a>,
     ) {
         self.builder.opt_span_lint(lint, span.map(|s| s.into()), decorator)
     }
@@ -843,7 +832,10 @@ impl<'tcx> LateContext<'tcx> {
     /// be used for pretty-printing HIR by rustc_hir_pretty.
     pub fn precedence(&self, expr: &hir::Expr<'_>) -> ExprPrecedence {
         let has_attr = |id: hir::HirId| -> bool {
-            self.tcx.hir_attrs(id).iter().any(hir::Attribute::is_prefix_attr_for_suggestions)
+            self.tcx
+                .hir_attrs(id)
+                .iter()
+                .any(rustc_attr_ir::Attribute::is_prefix_attr_for_suggestions)
         };
         expr.precedence(&has_attr)
     }

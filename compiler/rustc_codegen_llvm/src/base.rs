@@ -13,12 +13,12 @@
 
 use std::time::Instant;
 
+use rustc_attr_ir::Linkage;
 use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::base::maybe_create_entry_wrapper;
 use rustc_codegen_ssa::mono_item::MonoItemExt;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::small_c_str::SmallCStr;
-use rustc_hir::attrs::Linkage;
 use rustc_middle::dep_graph;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrs, SanitizerFnAttrs};
 use rustc_middle::mono::Visibility;
@@ -27,12 +27,11 @@ use rustc_session::config::{DebugInfo, Offload};
 use rustc_span::Symbol;
 use rustc_target::spec::SanitizerSet;
 
-use super::ModuleLlvm;
-use crate::attributes;
 use crate::builder::Builder;
 use crate::builder::gpu_offload::OffloadGlobals;
 use crate::context::CodegenCx;
 use crate::llvm::{self, Value};
+use crate::{ModuleLlvm, attributes};
 
 pub(crate) struct ValueIter<'ll> {
     cur: Option<&'ll Value>,
@@ -94,8 +93,8 @@ pub(crate) fn compile_codegen_unit(
             });
         // Instantiate monomorphizations without filling out definitions yet...
         let llvm_module = ModuleLlvm::new(tcx, cgu_name.as_str());
-        {
-            let mut cx = CodegenCx::new(tcx, cgu, &llvm_module, needs_bitcode);
+        llvm_module.with_module_refs(|module_refs| {
+            let mut cx = CodegenCx::new(tcx, cgu, module_refs, needs_bitcode);
 
             // Declare and store globals shared by all offload kernels
             //
@@ -214,7 +213,7 @@ pub(crate) fn compile_codegen_unit(
             if cx.sess().opts.debuginfo != DebugInfo::None {
                 cx.debuginfo_finalize();
             }
-        }
+        });
 
         ModuleCodegen::new_regular(cgu_name.to_string(), llvm_module)
     }
@@ -238,7 +237,6 @@ pub(crate) fn linkage_to_llvm(linkage: Linkage) -> llvm::Linkage {
         Linkage::WeakODR => llvm::Linkage::WeakODRLinkage,
         Linkage::Internal => llvm::Linkage::InternalLinkage,
         Linkage::ExternalWeak => llvm::Linkage::ExternalWeakLinkage,
-        Linkage::Common => llvm::Linkage::CommonLinkage,
     }
 }
 

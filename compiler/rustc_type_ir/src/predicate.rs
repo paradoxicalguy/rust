@@ -231,7 +231,7 @@ impl<I: Interner> ty::Binder<I, TraitClause<I>> {
     }
 
     pub fn self_ty(self) -> ty::Binder<I, I::Ty> {
-        self.map_bound(|trait_ref| trait_ref.self_ty())
+        self.map_bound_no_validate_bound_vars(|trait_ref| trait_ref.self_ty())
     }
 
     #[inline]
@@ -248,7 +248,10 @@ impl<I: Interner> UpcastFrom<I, TraitRef<I>> for TraitClause<I> {
 
 impl<I: Interner> UpcastFrom<I, ty::Binder<I, TraitRef<I>>> for ty::Binder<I, TraitClause<I>> {
     fn upcast_from(from: ty::Binder<I, TraitRef<I>>, _tcx: I) -> Self {
-        from.map_bound(|trait_ref| TraitClause { trait_ref, polarity: ClausePolarity::Positive })
+        from.map_bound_no_validate_bound_vars(|trait_ref| TraitClause {
+            trait_ref,
+            polarity: ClausePolarity::Positive,
+        })
     }
 }
 
@@ -495,6 +498,17 @@ impl<I: Interner> ExistentialProjection<I> {
         ExistentialTraitRef::new_from_args(interner, def_id, args)
     }
 
+    pub fn alias_kind(&self) -> ty::AliasTermKind<I> {
+        match self.term.kind() {
+            ty::TermKind::Ty(_) => {
+                ty::AliasTermKind::ProjectionTy { def_id: self.def_id.try_into().unwrap() }
+            }
+            ty::TermKind::Const(_) => {
+                ty::AliasTermKind::ProjectionConst { def_id: self.def_id.try_into().unwrap() }
+            }
+        }
+    }
+
     pub fn with_self_ty(&self, interner: I, self_ty: I::Ty) -> ProjectionClause<I> {
         // otherwise the escaping regions would be captured by the binders
         debug_assert!(!self_ty.has_escaping_bound_vars());
@@ -502,10 +516,7 @@ impl<I: Interner> ExistentialProjection<I> {
         ProjectionClause {
             projection_term: ty::AliasTerm::new(
                 interner,
-                interner.alias_term_kind_from_def_id(
-                    self.def_id.into(),
-                    ty::AliasConstInherentArgsKind::WithSelf,
-                ),
+                self.alias_kind(),
                 [self_ty.into()].iter().chain(self.args.iter()),
             ),
             term: self.term,

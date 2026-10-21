@@ -3,12 +3,12 @@ use std::ops::Deref as _;
 use rustc_abi::{
     Align, BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants,
 };
+use rustc_middle::mir;
 use rustc_middle::mir::PlaceTy;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_middle::{bug, mir};
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, bug};
 use tracing::{debug, instrument};
 
 use super::operand::OperandValue;
@@ -112,7 +112,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        if layout.peel_transparent_wrappers(bx).deref().is_scalable_vector() {
+        // FIXME(rustc_scalable_vector/stdarch_aarch64_sve): Scalable vectors aren't actually sized,
+        // but we pretend they are. Here we have to hack around that.
+        if layout.peel_transparent_wrappers_from_non_1zst(bx).deref().is_scalable_vector() {
             Self::alloca_scalable(bx, layout)
         } else {
             Self::alloca_size(bx, layout.size, layout)
@@ -159,7 +161,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         layout: TyAndLayout<'tcx>,
     ) -> Self {
         PlaceValue::new_sized(
-            bx.alloca_with_ty(layout.peel_transparent_wrappers(bx)),
+            // FIXME why is this peeling at all? The LLVM type should be the same for the
+            // transparent wrapper and the inner type.
+            bx.alloca_with_ty(layout.peel_transparent_wrappers_from_non_1zst(bx)),
             layout.align.abi,
         )
         .with_type(layout)
@@ -264,7 +268,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             Err(UninhabitedVariantError) => {
                 // We play it safe by using a well-defined `abort`, but we could go for immediate UB
                 // if that turns out to be helpful.
-                bx.abort();
+                bx.abort_immediate();
             }
             Ok(Some((tag_field, imm))) => {
                 let tag_place = self.project_field(bx, tag_field.as_usize());

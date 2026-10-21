@@ -3,14 +3,14 @@
 #![deny(implicit_provenance_casts)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![feature(alloc_io)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(binary_heap_drain_sorted)]
 #![feature(binary_heap_into_iter_sorted)]
 #![feature(binary_heap_pop_if)]
 #![feature(borrowed_buf_init)]
-#![feature(bstr)]
-#![feature(bstr_to_string)]
 #![feature(buf_read_has_data_left)]
+#![feature(byte_str)]
+#![feature(byte_str_to_string)]
 #![feature(can_vector)]
 #![feature(casefold)]
 #![feature(const_btree_len)]
@@ -60,7 +60,6 @@
 #![feature(unique_rc_arc)]
 #![feature(vec_deque_retain_range)]
 #![feature(vec_peek_mut)]
-#![feature(vec_try_remove)]
 #![feature(write_all_vectored)]
 // tidy-alphabetical-end
 
@@ -73,8 +72,8 @@ mod arc;
 mod autotraits;
 mod borrow;
 mod boxed;
-mod bstr;
 mod btree_set_hash;
+mod byte_str;
 mod c_str;
 mod c_str2;
 mod collections;

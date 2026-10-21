@@ -1,5 +1,5 @@
-use rustc_middle::bug;
 use rustc_middle::mir::{self, BasicBlock, Location, TerminatorEdges};
+use rustc_span::bug;
 
 use super::visitor::ResultsVisitor;
 use super::{Analysis, Effect, EffectIndex, SwitchTargetIndex};
@@ -127,6 +127,8 @@ impl Direction for Backward {
             analysis.apply_primary_statement_effect(state, stmt, loc);
             vis.visit_after_primary_statement_effect(state, stmt, loc);
         }
+
+        vis.visit_block_exit(state, block);
     }
 }
 
@@ -242,5 +244,7 @@ impl Direction for Forward {
         vis.visit_after_early_terminator_effect(state, term, loc);
         analysis.apply_primary_terminator_effect(state, term, loc);
         vis.visit_after_primary_terminator_effect(state, term, loc);
+
+        vis.visit_block_exit(state, block);
     }
 }

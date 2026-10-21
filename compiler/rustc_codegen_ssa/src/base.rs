@@ -9,14 +9,15 @@ use rustc_ast::expand::allocator::{
     ALLOC_ERROR_HANDLER, ALLOCATOR_METHODS, AllocatorKind, AllocatorMethod, AllocatorMethodInput,
     AllocatorTy,
 };
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{DebuggerVisualizerType, EiiDecl, EiiImpl, OptimizeAttr, find_attr};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
 use rustc_data_structures::sync::{IntoDynSyncSend, par_map};
 use rustc_data_structures::unord::UnordMap;
-use rustc_hir::attrs::lang_items::LangItem;
-use rustc_hir::attrs::{DebuggerVisualizerType, EiiDecl, EiiImpl, OptimizeAttr};
+use rustc_hir as hir;
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
-use rustc_hir::{ItemId, Target, find_attr};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::{Dependencies, Linkage};
@@ -28,13 +29,11 @@ use rustc_middle::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem, MonoItem
 use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, UintTy, Unnormalized};
-use rustc_middle::{bug, span_bug};
-use rustc_session::Session;
 use rustc_session::config::{self, EntryFnType};
-use rustc_span::{DUMMY_SP, Symbol};
+use rustc_span::{DUMMY_SP, Symbol, bug, span_bug};
 use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
-use rustc_target::spec::{Arch, Os};
+use rustc_target::spec::{Arch, Os, Target as TargetSpec};
 use rustc_trait_selection::infer::{BoundRegionConversionTime, TyCtxtInferExt};
 use rustc_trait_selection::traits::{ObligationCause, ObligationCtxt};
 use tracing::{debug, info};
@@ -373,8 +372,8 @@ pub(crate) fn build_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 // Returns `true` if this session's target will use native wasm
 // exceptions. This means that the VM does the unwinding for
 // us
-pub fn wants_wasm_eh(sess: &Session) -> bool {
-    sess.target.is_like_wasm
+pub fn wants_wasm_eh(target: &TargetSpec) -> bool {
+    target.is_like_wasm
 }
 
 /// Returns `true` if this session's target will use SEH-based unwinding.
@@ -382,15 +381,15 @@ pub fn wants_wasm_eh(sess: &Session) -> bool {
 /// This is only true for MSVC targets, and even then the 64-bit MSVC target
 /// currently uses SEH-ish unwinding with DWARF info tables to the side (same as
 /// 64-bit MinGW) instead of "full SEH".
-pub fn wants_msvc_seh(sess: &Session) -> bool {
-    sess.target.is_like_msvc
+pub fn wants_msvc_seh(target: &TargetSpec) -> bool {
+    target.is_like_msvc
 }
 
 /// Returns `true` if this session's target requires the new exception
 /// handling LLVM IR instructions (catchpad / cleanuppad / ... instead
 /// of landingpad)
-pub(crate) fn wants_new_eh_instructions(sess: &Session) -> bool {
-    wants_wasm_eh(sess) || wants_msvc_seh(sess)
+pub(crate) fn wants_new_eh_instructions(target: &TargetSpec) -> bool {
+    wants_wasm_eh(target) || wants_msvc_seh(target)
 }
 
 pub(crate) fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
@@ -405,7 +404,7 @@ pub(crate) fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
     mir::codegen_mir::<Bx>(cx, instance);
 }
 
-pub fn codegen_global_asm<'tcx, Cx>(cx: &mut Cx, item_id: ItemId)
+pub fn codegen_global_asm<'tcx, Cx>(cx: &mut Cx, item_id: hir::ItemId)
 where
     Cx: LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>> + AsmCodegenMethods<'tcx>,
 {
@@ -451,7 +450,7 @@ where
                     let instance = match ty.kind() {
                         &ty::FnDef(def_id, args) => Instance::expect_resolve(
                             cx.tcx(),
-                            ty::TypingEnv::fully_monomorphized(),
+                            cx.typing_env(),
                             def_id,
                             args.no_bound_vars().unwrap(),
                             expr.span,
@@ -593,7 +592,8 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             )
         };
 
-        let result = bx.call(start_ty, None, None, start_fn, &args, None, instance);
+        let result =
+            bx.call(start_ty, None, None, start_fn, ReturnSlot::Direct, &args, None, instance);
         if cx.sess().target.os == Os::Uefi {
             bx.ret(result);
         } else {
@@ -878,6 +878,10 @@ pub fn codegen_crate<
                         source: cgu.previous_work_product(tcx),
                     },
                 );
+                // This will unwind if there are errors, which triggers our `AbortCodegenOnDrop`
+                // guard. Unfortunately, just skipping the `submit_pre_lto_module_to_llvm` makes
+                // compilation hang on post-monomorphization errors.
+                tcx.dcx().abort_if_errors();
             }
             CguReuse::PostLto => {
                 submit_post_lto_module_to_llvm(
@@ -1059,7 +1063,7 @@ impl CrateInfo {
         let n_crates = crates.len();
         let mut info = CrateInfo {
             target_cpu,
-            target_features: tcx.global_backend_features(()).clone(),
+            target_features: tcx.sess.global_backend_features.clone(),
             crate_types,
             exported_symbols,
             linked_symbols,

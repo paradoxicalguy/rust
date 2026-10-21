@@ -24,10 +24,10 @@ use rustc_middle::mir::{
     MirPhase, Operand, Place, ProjectionElem, Promoted, RuntimePhase, Rvalue, START_BLOCK,
     SourceInfo, Statement, StatementKind, TerminatorKind, WithRetag,
 };
+use rustc_middle::query;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_middle::util::Providers;
-use rustc_middle::{bug, query, span_bug};
-use rustc_span::{DUMMY_SP, Spanned, sym};
+use rustc_span::{DUMMY_SP, Spanned, bug, span_bug, sym};
 use tracing::debug;
 
 #[macro_use]
@@ -37,6 +37,7 @@ use std::sync::LazyLock;
 
 use pass_manager::{self as pm, Lint, MirLint, MirPass, PassCtx, PassPolicy, WithMinOptLevel};
 
+mod canonicalization;
 mod check_pointers;
 mod cost_checker;
 mod cross_crate_inline;
@@ -169,7 +170,7 @@ declare_passes! {
     mod prettify : ReorderBasicBlocks, ReorderLocals;
     mod promote_consts : PromoteTemps;
     mod ref_prop : ReferencePropagation;
-    pub mod remove_noop_landing_pads : RemoveNoopLandingPads;
+    mod remove_noop_landing_pads : RemoveNoopLandingPads;
     mod remove_place_mention : RemovePlaceMention;
     mod remove_storage_markers : RemoveStorageMarkers;
     mod remove_uninit_drops : RemoveUninitDrops;
@@ -205,6 +206,7 @@ declare_passes! {
     mod sroa : ScalarReplacementOfAggregates;
     mod strip_debuginfo : StripDebugInfo;
     mod ssa_range_prop: SsaRangePropagation;
+    mod tail_copy_to_move : TailCopyToMove;
     mod unreachable_enum_branching : UnreachableEnumBranching;
     mod unreachable_prop : UnreachablePropagation;
     mod validate : Validator;
@@ -215,6 +217,8 @@ pub fn provide(providers: &mut Providers) {
     ffi_unwind_calls::provide(&mut providers.queries);
     shim::provide(&mut providers.queries);
     cross_crate_inline::provide(&mut providers.queries);
+    providers.hooks.find_noop_landing_pads_for_instance =
+        remove_noop_landing_pads::find_noop_landing_pads_for_instance;
     providers.queries = query::Providers {
         mir_keys,
         mir_built,
@@ -445,10 +449,9 @@ fn mir_promoted(
         {
             tcx.mir_const_qualif(def)
         }
-        DefKind::AssocConst { .. }
-        | DefKind::Const { .. }
-        | DefKind::Static { .. }
-        | DefKind::AnonConst => tcx.mir_const_qualif(def),
+        DefKind::AssocConst | DefKind::Const | DefKind::Static { .. } | DefKind::AnonConst => {
+            tcx.mir_const_qualif(def)
+        }
         _ => ConstQualifs::default(),
     };
 
@@ -480,6 +483,12 @@ fn mir_promoted(
         &[&promote_pass, &simplify::SimplifyCfg::PromoteConsts, &coverage::InstrumentCoverage],
         Some(MirPhase::Analysis(AnalysisPhase::Initial)),
     );
+
+    // Avoid over-capacity in the vectors of basic blocks, which can take up substantial memory.
+    // This costs a tiny bit of performance to save a lot of memory.
+    for bb in body.basic_blocks.as_mut_preserves_cfg() {
+        bb.statements.shrink_to_fit();
+    }
 
     lint_tail_expr_drop_order::run_lint(tcx, def, &body);
 
@@ -577,8 +586,8 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
         DefKind::Fn
         | DefKind::AssocFn
         | DefKind::Static { .. }
-        | DefKind::Const { .. }
-        | DefKind::AssocConst { .. } => {
+        | DefKind::Const
+        | DefKind::AssocConst => {
             if let Err(guar) = tcx.ensure_result().check_well_formed(root) {
                 body.tainted_by_errors = Some(guar);
             }
@@ -760,6 +769,7 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
             &copy_prop::CopyProp,
             &dead_store_elimination::DeadStoreElimination::Final,
             &dest_prop::DestinationPropagation,
+            &tail_copy_to_move::TailCopyToMove,
             &simplify::SimplifyLocals::Final,
             &multiple_return_terminators::MultipleReturnTerminators,
             // Some cleanup necessary at least for LLVM and potentially other codegen backends.

@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_ast::{AttrStyle, MetaItemLit, Safety};
 use rustc_attr_ir::target::Target;
-use rustc_attr_ir::{AttrPath, Attribute, AttributeKind};
+use rustc_attr_ir::{AttrPath, Attribute, AttributeKind, HashIgnoredAttrId};
 use rustc_data_structures::sync::{DynSend, DynSync};
-use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
+use rustc_errors::{Diag, DiagCtxtHandle, DiagLocation, Diagnostic, Level, MultiSpan};
 use rustc_feature::AttributeStability;
 use rustc_lint_defs::builtin::UNUSED_ATTRIBUTES;
 use rustc_lint_defs::{Lint, LintId};
@@ -43,6 +43,7 @@ use crate::attributes::dummy::*;
 use crate::attributes::inline::*;
 use crate::attributes::instruction_set::*;
 use crate::attributes::link_attrs::*;
+use crate::attributes::lint::*;
 use crate::attributes::lint_helpers::*;
 use crate::attributes::loop_match::*;
 use crate::attributes::macro_attrs::*;
@@ -102,7 +103,7 @@ pub(crate) type FinalizeFn = fn(&mut FinalizeContext<'_, '_>) -> FinalizeOutput;
 /// finalized, so it can inspect the fully parsed attributes via
 /// [`FinalizeCheckContext::parsed_attrs`]. The [`Span`] is the span of the attribute the
 /// check is associated with, used for diagnostics.
-pub(crate) type FinalizeCheckFn = fn(&FinalizeCheckContext<'_, '_>, Span);
+pub(crate) type FinalizeCheckFn = fn(&mut FinalizeCheckContext<'_, '_>, Span);
 
 /// The result of finalizing a single attribute parser.
 pub(crate) struct FinalizeOutput {
@@ -166,6 +167,7 @@ attribute_parsers!(
         ConfusablesParser,
         ConstStabilityParser,
         DocParser,
+        LintParser,
         MacroUseParser,
         NakedParser,
         OnConstParser,
@@ -232,6 +234,7 @@ attribute_parsers!(
         Single<ReexportTestHarnessMainParser>,
         Single<RustcAbiParser>,
         Single<RustcAllocatorZeroedVariantParser>,
+        Single<RustcAssertVarianceParser>,
         Single<RustcAutodiffParser>,
         Single<RustcBuiltinMacroParser>,
         Single<RustcDeprecatedSafe2024Parser>,
@@ -249,6 +252,7 @@ attribute_parsers!(
         Single<RustcObjcClassParser>,
         Single<RustcObjcSelectorParser>,
         Single<RustcScalableVectorParser>,
+        Single<RustcShowSpans>,
         Single<RustcSimdMonomorphizeLaneLimitParser>,
         Single<RustcSkipDuringMethodDispatchParser>,
         Single<RustcTestMarkerParser>,
@@ -259,6 +263,7 @@ attribute_parsers!(
         Single<UnrollParser>,
         Single<WindowsSubsystemParser>,
         Single<WithoutArgs<AllowInternalUnsafeParser>>,
+        Single<WithoutArgs<AlwaysGcaParser>>,
         Single<WithoutArgs<AutomaticallyDerivedParser>>,
         Single<WithoutArgs<ColdParser>>,
         Single<WithoutArgs<CompilerBuiltinsParser>>,
@@ -386,6 +391,11 @@ pub struct AcceptContext<'f, 'sess> {
     /// Whether it is an inner or outer attribute.
     pub(crate) attr_style: AttrStyle,
 
+    /// Used for lint attributes.
+    ///
+    /// These should not end up in query results, as they cannot be deserialized from disk.
+    pub(crate) attr_id: Option<HashIgnoredAttrId>,
+
     /// A description of the thing we are parsing using this attribute parser.
     /// We are not only using these parsers for attributes, but also for macros such as the `cfg!()` macro.
     pub(crate) parsed_description: ParsedDescription,
@@ -407,6 +417,7 @@ pub struct AcceptContext<'f, 'sess> {
 }
 
 impl<'f, 'sess: 'f> SharedContext<'f, 'sess> {
+    #[track_caller]
     pub(crate) fn emit_err(&self, diag: impl for<'x> Diagnostic<'x>) -> ErrorGuaranteed {
         self.cx.emit_err(diag)
     }
@@ -414,21 +425,27 @@ impl<'f, 'sess: 'f> SharedContext<'f, 'sess> {
     /// Emit a lint. This method is somewhat special, since lints emitted during attribute parsing
     /// must be delayed until after HIR is built. This method will take care of the details of
     /// that.
+    #[track_caller]
     pub(crate) fn emit_lint(
         &mut self,
         lint: &'static Lint,
-        diagnostic: impl for<'x> Diagnostic<'x, ()> + DynSend + DynSync + 'static,
+        diagnostic: impl for<'x> Diagnostic<'x> + DynSend + DynSync + 'static,
         span: impl Into<MultiSpan>,
     ) {
+        let emitted_at = DiagLocation::caller();
         self.emit_lint_inner(
             lint,
-            EmitAttribute(Box::new(move |dcx, level, _| diagnostic.into_diag(dcx, level))),
+            EmitAttribute(Box::new(move |dcx, level, _| {
+                let mut diag = diagnostic.into_diag(dcx, level);
+                diag.emitted_at = emitted_at;
+                diag
+            })),
             span,
         );
     }
 
     pub(crate) fn emit_lint_with_sess<
-        F: for<'a> FnOnce(DiagCtxtHandle<'a>, Level, &Session) -> Diag<'a, ()>
+        F: for<'a> FnOnce(DiagCtxtHandle<'a>, Level, &Session) -> Diag<'a>
             + DynSend
             + DynSync
             + 'static,
@@ -496,6 +513,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// The provided span is used as a fallback for diagnostic generation in case `arg` does not
     /// contain any. It should be the span of the node that contains `arg`.
+    #[track_caller]
     pub(crate) fn expect_single_element_list<'arg>(
         &mut self,
         arg: &'arg ArgParser,
@@ -528,6 +546,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// - You want to emit your own diagnostics (for instance, with [`SharedContext::emit_err`]).
     /// - The attribute can be parsed in multiple ways and it does not make sense to emit an error.
+    #[track_caller]
     pub(crate) fn expect_list<'arg>(
         &mut self,
         args: &'arg ArgParser,
@@ -549,6 +568,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// - You want to emit your own diagnostics (for instance, with [`SharedContext::emit_err`]).
     /// - The attribute can be parsed in multiple ways and it does not make sense to emit an error.
+    #[track_caller]
     pub(crate) fn expect_single<'arg>(
         &mut self,
         list: &'arg MetaItemListParser,
@@ -588,6 +608,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// - You want to emit your own diagnostics (for instance, with [`SharedContext::emit_err`]).
     /// - The attribute can be parsed in multiple ways and it does not make sense to emit an error.
+    #[track_caller]
     pub(crate) fn expect_name_value<'arg, Arg>(
         &mut self,
         arg: &'arg Arg,
@@ -608,6 +629,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// - You want to emit your own diagnostics (for instance, with [`SharedContext::emit_err`]).
     /// - The attribute can be parsed in multiple ways and it does not make sense to emit an error.
+    #[track_caller]
     pub(crate) fn expect_no_args<'arg>(&mut self, arg: &'arg ArgParser) -> Option<()> {
         if let Err(span) = arg.as_no_args() {
             self.adcx().expected_no_args(span);
@@ -630,6 +652,7 @@ impl<'f, 'sess: 'f> AcceptContext<'f, 'sess> {
     ///
     /// - You want to emit your own diagnostics (for instance, with [`SharedContext::emit_err`]).
     /// - The attribute can be parsed in multiple ways and it does not make sense to emit an error.
+    #[track_caller]
     pub(crate) fn expect_string_literal<'arg, Arg>(&mut self, arg: &'arg Arg) -> Option<Symbol>
     where
         Arg: ExpectStringLiteral,
@@ -643,6 +666,7 @@ pub(crate) trait ExpectNameValue {
     where
         Self: 'a;
 
+    #[track_caller]
     fn expect_name_value<'a, 'f, 'sess>(
         &'a self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -654,6 +678,7 @@ pub(crate) trait ExpectNameValue {
 impl ExpectNameValue for MetaItemOrLitParser {
     type Output<'a> = (Ident, &'a NameValueParser);
 
+    #[track_caller]
     fn expect_name_value<'a, 'f, 'sess>(
         &'a self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -672,6 +697,7 @@ impl ExpectNameValue for MetaItemOrLitParser {
 impl ExpectNameValue for MetaItemParser {
     type Output<'a> = (Ident, &'a NameValueParser);
 
+    #[track_caller]
     fn expect_name_value<'a, 'f, 'sess>(
         &'a self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -696,6 +722,7 @@ impl ExpectNameValue for MetaItemParser {
 impl ExpectNameValue for ArgParser {
     type Output<'a> = &'a NameValueParser;
 
+    #[track_caller]
     fn expect_name_value<'a, 'f, 'sess>(
         &'a self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -712,11 +739,13 @@ impl ExpectNameValue for ArgParser {
 }
 
 pub(crate) trait ExpectStringLiteral {
+    #[track_caller]
     fn expect_string_literal<'f, 'sess>(&self, cx: &mut AcceptContext<'f, 'sess>)
     -> Option<Symbol>;
 }
 
 impl ExpectStringLiteral for NameValueParser {
+    #[track_caller]
     fn expect_string_literal<'f, 'sess>(
         &self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -730,6 +759,7 @@ impl ExpectStringLiteral for NameValueParser {
 }
 
 impl ExpectStringLiteral for MetaItemOrLitParser {
+    #[track_caller]
     fn expect_string_literal<'f, 'sess>(
         &self,
         cx: &mut AcceptContext<'f, 'sess>,
@@ -833,6 +863,10 @@ pub(crate) struct FinalizeCheckContext<'p, 'sess> {
     ///
     /// Unlike [`all_attrs`](Self::all_attrs), this contains the fully parsed attributes.
     pub(crate) parsed_attrs: &'p [Attribute],
+
+    /// The AST item these attributes were applied to, when the target is an item.
+    /// Used by `finalize_check` to inspect item structure that is not encoded in [`Target`].
+    pub(crate) target_item: Option<&'p rustc_ast::ast::Item>,
 }
 
 impl<'p, 'sess: 'p> Deref for FinalizeCheckContext<'p, 'sess> {
@@ -888,11 +922,12 @@ pub enum ShouldEmit {
 }
 
 impl ShouldEmit {
+    #[track_caller]
     pub(crate) fn emit_err(self, diag: Diag<'_>) -> ErrorGuaranteed {
         match self {
-            ShouldEmit::EarlyFatal { .. } if diag.level() == Level::DelayedBug => diag.emit(),
-            ShouldEmit::EarlyFatal { .. } => diag.upgrade_to_fatal().emit(),
-            ShouldEmit::ErrorsAndLints { .. } => diag.emit(),
+            ShouldEmit::EarlyFatal { .. } if diag.level() == Level::DelayedBug => diag.emit_err(),
+            ShouldEmit::EarlyFatal { .. } => diag.upgrade_to_fatal().emit_fatal(),
+            ShouldEmit::ErrorsAndLints { .. } => diag.emit_err(),
             ShouldEmit::Nothing => diag.delay_as_bug(),
         }
     }
@@ -907,6 +942,7 @@ pub(crate) struct AttributeDiagnosticContext<'a, 'f, 'sess> {
 }
 
 impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
+    #[track_caller]
     fn emit_parse_error(
         &mut self,
         mut span: Span,
@@ -945,6 +981,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
 
 /// Helpers that can be used to generate errors during attribute parsing.
 impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
+    #[track_caller]
     pub(crate) fn expected_integer_literal_in_range(
         &mut self,
         span: Span,
@@ -959,6 +996,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
 
     /// The provided span is used as a fallback in case `args` does not contain any. It should be
     /// the span of the node that contains `args`.
+    #[track_caller]
     pub(crate) fn expected_list(&mut self, span: Span, args: &ArgParser) -> ErrorGuaranteed {
         let span = match args {
             ArgParser::NoArgs => span,
@@ -968,6 +1006,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedList)
     }
 
+    #[track_caller]
     pub(crate) fn expected_list_with_num_args_or_more(
         &mut self,
         args: usize,
@@ -979,45 +1018,54 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         )
     }
 
+    #[track_caller]
     pub(crate) fn expected_list_or_no_args(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedListOrNoArgs)
     }
 
+    #[track_caller]
     pub(crate) fn expected_nv_or_no_args(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNameValueOrNoArgs)
     }
 
+    #[track_caller]
     pub(crate) fn expected_non_empty_string_literal(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNonEmptyStringLiteral)
     }
 
+    #[track_caller]
     pub(crate) fn expected_no_args(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNoArgs)
     }
 
     /// Emit an error that a `name` was expected here
+    #[track_caller]
     pub(crate) fn expected_identifier(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedIdentifier)
     }
 
     /// Emit an error that a `name = value` pair was expected at this span. The symbol can be given for
     /// a nicer error message talking about the specific name that was found lacking a value.
+    #[track_caller]
     fn expected_name_value(&mut self, span: Span, name: Option<Symbol>) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNameValue(name))
     }
 
     /// Emit an error that a `name = value` argument is missing in a list of name-value pairs.
+    #[track_caller]
     pub(crate) fn missing_name_value(&mut self, span: Span, name: Symbol) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::MissingNameValue(name))
     }
 
     /// Emit an error that a `name = value` pair was found where that name was already seen.
+    #[track_caller]
     pub(crate) fn duplicate_key(&mut self, span: Span, key: Symbol) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::DuplicateKey(key))
     }
 
     /// An error that should be emitted when a [`MetaItemOrLitParser`]
     /// was expected *not* to be a literal, but instead a meta item.
+    #[track_caller]
     pub(crate) fn expected_not_literal(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNotLiteral)
     }
@@ -1026,6 +1074,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
     /// The `provided_arguments` argument allows distinguishing between "expected an argument here"
     /// (when zero arguments are provided) and "expect a single argument here" (when two or more
     /// arguments are provided).
+    #[track_caller]
     pub(crate) fn expected_single_argument(
         &mut self,
         span: Span,
@@ -1040,11 +1089,13 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         self.emit_parse_error(span, reason)
     }
 
+    #[track_caller]
     pub(crate) fn expected_at_least_one_argument(&mut self, span: Span) -> ErrorGuaranteed {
         self.emit_parse_error(span, AttributeParseErrorReason::ExpectedAtLeastOneArgument)
     }
 
     /// Produces an error along the lines of `expected one of [foo, meow]`
+    #[track_caller]
     pub(crate) fn expected_specific_argument(
         &mut self,
         span: Span,
@@ -1062,6 +1113,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
 
     /// Produces an error along the lines of `expected one of [foo, meow] as an argument`.
     /// i.e. slightly different wording to [`expected_specific_argument`](Self::expected_specific_argument).
+    #[track_caller]
     pub(crate) fn expected_specific_argument_and_list(
         &mut self,
         span: Span,
@@ -1078,6 +1130,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
     }
 
     /// produces an error along the lines of `expected one of ["foo", "meow"]`
+    #[track_caller]
     pub(crate) fn expected_specific_argument_strings(
         &mut self,
         span: Span,

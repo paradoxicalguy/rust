@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use rustc_ast::{self as ast, Crate, DelegationSuffixes, NodeId};
 use rustc_ast_pretty::pprust;
+use rustc_attr_ir::{Attribute, AttributeKind, CfgEntry, StabilityLevel, StrippedCfgItem};
 use rustc_attr_parsing::AttributeParser;
+use rustc_data_structures::sync::RwLock;
 use rustc_errors::{Applicability, StashKey};
 use rustc_expand::base::{
     Annotatable, DeriveResolution, Indeterminate, ResolverExpand, SyntaxExtension,
@@ -16,10 +18,8 @@ use rustc_expand::compile_declarative_macro;
 use rustc_expand::expand::{
     AstFragment, AstFragmentKind, Invocation, InvocationKind, SupportsMacroExpansion,
 };
-use rustc_hir::attrs::{AttributeKind, CfgEntry, StrippedCfgItem};
 use rustc_hir::def::{DefKind, MacroKinds, Namespace, NonMacroAttrKind};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
-use rustc_hir::{Attribute, StabilityLevel};
 use rustc_lint_defs::builtin::{
     LEGACY_DERIVE_HELPERS, OUT_OF_SCOPE_MACRO_CALLS, UNUSED_MACRO_RULES, UNUSED_MACROS,
 };
@@ -41,7 +41,7 @@ use crate::diagnostics::{
 use crate::hygiene::Macros20NormalizedSyntaxContext;
 use crate::imports::Import;
 use crate::{
-    BindingKey, CacheCell, CmResolver, Decl, DeclKind, DeriveData, Determinacy, Finalize, IdentKey,
+    BindingKey, CmResolver, Decl, DeclKind, DeriveData, Determinacy, Finalize, IdentKey,
     InvocationParent, ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, Res,
     ResolutionError, Resolver, ScopeSet, Segment, Used,
 };
@@ -79,7 +79,7 @@ pub(crate) enum MacroRulesScope<'ra> {
 /// This helps to avoid uncontrollable growth of `macro_rules!` scope chains,
 /// which usually grow linearly with the number of macro invocations
 /// in a module (including derives) and hurt performance.
-pub(crate) type MacroRulesScopeRef<'ra> = &'ra CacheCell<MacroRulesScope<'ra>>;
+pub(crate) type MacroRulesScopeRef<'ra> = &'ra RwLock<MacroRulesScope<'ra>>;
 
 /// Macro namespace is separated into two sub-namespaces, one for bang macros and
 /// one for attribute-like macros (attributes, derives).
@@ -366,12 +366,30 @@ impl<'ra, 'tcx> ResolverExpand for Resolver<'ra, 'tcx> {
     }
 
     fn check_unused_macros(&mut self) {
-        for (_, &(node_id, ident)) in self.unused_macros.iter() {
+        for (_, &(node_id, ident, parent_def_id)) in self.unused_macros.iter() {
+            let mut unannotated_mod = None;
+            let mut annotated_mod = None;
+            if let Some(def_id) = parent_def_id {
+                let span = self.def_span(def_id);
+                let node_id = self.def_id_to_node_id(def_id.expect_local());
+                if ast::CRATE_NODE_ID != node_id {
+                    if self.macro_use_mods.contains(&node_id) {
+                        annotated_mod = Some(span);
+                    } else {
+                        unannotated_mod = Some(span.shrink_to_lo());
+                    }
+                }
+            }
+
             self.lint_buffer.buffer_lint(
                 UNUSED_MACROS,
                 node_id,
                 ident.span,
-                diagnostics::UnusedMacroDefinition { name: ident.name },
+                diagnostics::UnusedMacroDefinition {
+                    name: ident.name,
+                    unannotated_mod,
+                    annotated_mod,
+                },
             );
             // Do not report unused individual rules if the entire macro is unused
             self.unused_macro_rules.swap_remove(&node_id);
@@ -1097,7 +1115,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     feature,
                     reason.to_opt_reason(),
                     issue,
-                    None,
                     span,
                     stability::UnstableKind::Regular,
                 );
@@ -1143,7 +1160,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         if let Some((mod_def_id, node_id)) = invoc_in_mod_inert_attr
             && let Some(decl) = decl
             // This is a `macro_rules` itself, not some import.
-            && let DeclKind::Def(res) = decl.kind
+            && let DeclKind::Def(res, _) = decl.kind
             && let Res::Def(DefKind::Macro(kinds), def_id) = res
             && kinds.contains(MacroKinds::BANG)
             // And the `macro_rules` is defined inside the attribute's module,
@@ -1212,7 +1229,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         &self,
         macro_def: &ast::MacroDef,
         ident: Ident,
-        attrs: &[rustc_hir::Attribute],
+        attrs: &[rustc_attr_ir::Attribute],
         span: Span,
         node_id: NodeId,
         edition: Edition,

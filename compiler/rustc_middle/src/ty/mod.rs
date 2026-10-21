@@ -26,7 +26,7 @@ pub use generic_args::{GenericArgKind, TermKind, *};
 pub use generics::*;
 pub use intrinsic::IntrinsicDef;
 use rustc_abi::{
-    Align, FieldIdx, Integer, IntegerType, ReprFlags, ReprOptions, ScalableElt, VariantIdx,
+    Align, FieldIdx, Integer, IntegerType, ReprFlags, ReprOptions, ScalableElt, Size, VariantIdx,
 };
 use rustc_ast::{self as ast};
 pub use rustc_ast_ir::{Movability, Mutability, try_visit};
@@ -50,7 +50,7 @@ use rustc_serialize::{Decodable, Encodable};
 use rustc_session::config::OptLevel;
 use rustc_span::def_id::{LocalModId, ModId};
 use rustc_span::hygiene::MacroKind;
-use rustc_span::{DUMMY_SP, ExpnKind, Ident, Span, Symbol};
+use rustc_span::{DUMMY_SP, ExpnKind, Ident, Span, Symbol, bug};
 use rustc_target::callconv::FnAbi;
 pub use rustc_type_ir::data_structures::{DelayedMap, DelayedSet};
 pub use rustc_type_ir::fast_reject::DeepRejectCtxt;
@@ -124,6 +124,8 @@ pub mod abstract_const;
 pub mod adjustment;
 pub mod cast;
 pub mod codec;
+// FIXME(#159654): This should get deleted soon
+pub mod consts;
 pub mod error;
 pub mod fast_reject;
 pub mod inhabitedness;
@@ -143,7 +145,6 @@ pub mod vtable;
 mod adt;
 mod assoc;
 mod closure;
-mod consts;
 mod context;
 mod diagnostics;
 mod elaborate_impl;
@@ -428,19 +429,19 @@ impl Visibility<LocalModId> {
     }
 }
 
-impl<Id: Into<DefId>> Visibility<Id> {
-    /// Returns `true` if an item with this visibility is accessible from the given module.
-    pub fn is_accessible_from(self, module: impl Into<DefId>, tcx: TyCtxt<'_>) -> bool {
+impl<Id: Into<ModId>> Visibility<Id> {
+    /// Returns `true` if an item with this visibility is accessible from the given definition.
+    pub fn is_accessible_from(self, def_id: impl Into<DefId>, tcx: TyCtxt<'_>) -> bool {
         match self {
             // Public items are visible everywhere.
             Visibility::Public => true,
-            Visibility::Restricted(id) => tcx.is_descendant_of(module, id),
+            Visibility::Restricted(id) => tcx.is_descendant_of(def_id, id.into()),
         }
     }
 
     pub fn partial_cmp(
         self,
-        vis: Visibility<impl Into<DefId>>,
+        vis: Visibility<impl Into<ModId>>,
         tcx: TyCtxt<'_>,
     ) -> Option<Ordering> {
         match (self, vis) {
@@ -449,18 +450,18 @@ impl<Id: Into<DefId>> Visibility<Id> {
             (Visibility::Restricted(_), Visibility::Public) => Some(Ordering::Less),
             (Visibility::Restricted(lhs_id), Visibility::Restricted(rhs_id)) => {
                 let (lhs_id, rhs_id) = (lhs_id.into(), rhs_id.into());
-                tcx.def_id_partial_cmp(lhs_id, rhs_id)
+                tcx.def_id_partial_cmp(lhs_id.to_def_id(), rhs_id.to_def_id())
             }
         }
     }
 }
 
-impl<Id: Into<DefId> + Debug + Copy> Visibility<Id> {
+impl<Id: Into<ModId> + Debug + Copy> Visibility<Id> {
     /// Returns `true` if this visibility is strictly larger than the given visibility.
     #[track_caller]
     pub fn greater_than(
         self,
-        vis: Visibility<impl Into<DefId> + Debug + Copy>,
+        vis: Visibility<impl Into<ModId> + Debug + Copy>,
         tcx: TyCtxt<'_>,
     ) -> bool {
         match self.partial_cmp(vis, tcx) {
@@ -1108,6 +1109,18 @@ pub struct TypingEnv<'tcx> {
     pub param_env: ParamEnv<'tcx>,
 }
 
+impl<'tcx> rustc_type_ir::inherent::TypingEnv<TyCtxt<'tcx>> for TypingEnv<'tcx> {
+    fn fully_monomorphized() -> Self {
+        Self::fully_monomorphized()
+    }
+
+    fn layout_size(self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Size {
+        tcx.layout_of(self.as_query_input(ty))
+            .unwrap_or_else(|e| panic!("could not compute layout for {ty:?}: {e:?}"))
+            .size
+    }
+}
+
 impl<'tcx> TypingEnv<'tcx> {
     pub fn new(param_env: ParamEnv<'tcx>, typing_mode: TypingMode<'tcx>) -> Self {
         Self { typing_mode: TypingModeEqWrapper(typing_mode), param_env }
@@ -1175,7 +1188,23 @@ impl<'tcx> TypingEnv<'tcx> {
 
     /// Modify the `typing_mode` to `PostAnalysis` or `Codegen` and eagerly reveal all opaque types
     /// in the `param_env`.
-    pub fn with_post_analysis_normalized(self, tcx: TyCtxt<'tcx>) -> TypingEnv<'tcx> {
+    ///
+    /// Changing the typing_mode to `PostAnalysis` can result in aliases now being normalizeable,
+    /// so we need to explicitly renormalize them. This mainly affects opaque types which were
+    /// previously treated as rigid but can now be normalized to their underlying type, as well as
+    /// aliases with opaque args.
+    /// Values that contain types/consts from the previous typing env and that will be used in the
+    /// new `PostAnalysis` typing env should be folded by this method to allow renormalization.
+    ///
+    /// FIXME: we might want to return `Unnormalized` since we force the value to be non-rigid.
+    pub fn with_post_analysis_normalized_invalidating_rigid_aliases<T>(
+        self,
+        tcx: TyCtxt<'tcx>,
+        value: T,
+    ) -> PseudoCanonicalInput<'tcx, T>
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
         let TypingEnv { typing_mode, param_env } = self;
         match typing_mode.0.assert_not_erased() {
             TypingMode::Coherence
@@ -1183,16 +1212,24 @@ impl<'tcx> TypingEnv<'tcx> {
             | TypingMode::Typeck { .. }
             | TypingMode::PostTypeckUntilBorrowck { .. }
             | TypingMode::PostBorrowck { .. } => {}
-            TypingMode::PostAnalysis | TypingMode::Codegen => return self,
+            TypingMode::PostAnalysis | TypingMode::Codegen => return self.as_query_input(value),
         }
 
         let param_env = param_env.with_normalized(tcx);
-        TypingEnv::new(param_env, TypingMode::PostAnalysis)
+        let value = ty::set_aliases_to_non_rigid(tcx, value).skip_norm_wip();
+        TypingEnv::new(param_env, TypingMode::PostAnalysis).as_query_input(value)
     }
 
-    /// Modify the `typing_mode` to `PostAnalysis` or `Codegen` and eagerly reveal all opaque types
-    /// in the `param_env`.
-    pub fn with_codegen_normalized(self, tcx: TyCtxt<'tcx>) -> TypingEnv<'tcx> {
+    /// Same as `with_post_analysis_normalized_invalidating_rigid_aliases` except that we use
+    /// the `Codegen` typing mode.
+    pub fn with_codegen_normalized_invalidating_rigid_aliases<T>(
+        self,
+        tcx: TyCtxt<'tcx>,
+        value: T,
+    ) -> PseudoCanonicalInput<'tcx, T>
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
         let TypingEnv { typing_mode, param_env } = self;
         match typing_mode.0.assert_not_erased() {
             TypingMode::Coherence
@@ -1201,11 +1238,12 @@ impl<'tcx> TypingEnv<'tcx> {
             | TypingMode::PostTypeckUntilBorrowck { .. }
             | TypingMode::PostBorrowck { .. }
             | TypingMode::PostAnalysis => {}
-            TypingMode::Codegen => return self,
+            TypingMode::Codegen => return self.as_query_input(value),
         }
 
         let param_env = param_env.with_normalized(tcx);
-        TypingEnv::new(param_env, TypingMode::Codegen)
+        let value = ty::set_aliases_to_non_rigid(tcx, value).skip_norm_wip();
+        TypingEnv::new(param_env, TypingMode::Codegen).as_query_input(value)
     }
 
     /// Combine this typing environment with the given `value` to be used by
@@ -1736,9 +1774,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     pub fn opt_associated_item(self, def_id: DefId) -> Option<AssocItem> {
-        if let DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy =
-            self.def_kind(def_id)
-        {
+        if let DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy = self.def_kind(def_id) {
             Some(self.associated_item(def_id))
         } else {
             None
@@ -1836,9 +1872,9 @@ impl<'tcx> TyCtxt<'tcx> {
                 let def_kind = self.def_kind(def);
                 debug!("returned from def_kind: {:?}", def_kind);
                 match def_kind {
-                    DefKind::Const { .. }
+                    DefKind::Const
                     | DefKind::Static { .. }
-                    | DefKind::AssocConst { .. }
+                    | DefKind::AssocConst
                     | DefKind::Ctor(..)
                     | DefKind::AnonConst => self.mir_for_ctfe(def),
                     DefKind::Fn | DefKind::AssocFn
@@ -1871,7 +1907,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Gets all attributes with the given name.
-    #[deprecated = "Though there are valid usecases for this method, especially when your attribute is not a parsed attribute, usually you want to call rustc_hir::find_attr! instead."]
+    #[deprecated = "Though there are valid usecases for this method, especially when your attribute is not a parsed attribute, usually you want to use `rustc_attr_ir::find_attr!` instead."]
     pub fn get_attrs(
         self,
         did: impl Into<DefId>,
@@ -1890,7 +1926,7 @@ impl<'tcx> TyCtxt<'tcx> {
     ///
     /// </div>
     ///
-    #[deprecated = "Though there are valid usecases for this method, especially when your attribute is not a parsed attribute, usually you want to call rustc_hir::find_attr! instead."]
+    #[deprecated = "Though there are valid usecases for this method, especially when your attribute is not a parsed attribute, usually you want to use `rustc_attr_ir::find_attr!` instead."]
     pub fn get_all_attrs(self, did: impl Into<DefId>) -> &'tcx [rustc_attr_ir::Attribute] {
         let did: DefId = did.into();
         if let Some(did) = did.as_local() {
@@ -2185,13 +2221,13 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         mut ident: Ident,
         scope: DefId,
-        item_id: LocalDefId,
+        mod_id: LocalModId,
     ) -> (Ident, ModId) {
         let scope = ident
             .span
             .normalize_to_macros_2_0_and_adjust(self.expn_that_defined(scope))
             .and_then(|actual_expansion| actual_expansion.expn_data().parent_module)
-            .unwrap_or_else(|| self.parent_module_from_def_id(item_id).to_mod_id());
+            .unwrap_or(mod_id.to_mod_id());
         (ident, scope)
     }
 
@@ -2278,10 +2314,10 @@ impl<'tcx> TyCtxt<'tcx> {
             | DefKind::TyAlias
             | DefKind::ForeignTy
             | DefKind::TyParam
-            | DefKind::Const { .. }
+            | DefKind::Const
             | DefKind::ConstParam
             | DefKind::Static { .. }
-            | DefKind::AssocConst { .. }
+            | DefKind::AssocConst
             | DefKind::Macro(_)
             | DefKind::ExternCrate
             | DefKind::Use

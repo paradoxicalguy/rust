@@ -344,6 +344,9 @@ pub fn crate_description(crates: &[impl AsRef<str>]) -> String {
     if crates.is_empty() {
         return "".into();
     }
+    if crates.len() == 1 {
+        return crates[0].as_ref().into();
+    }
 
     let mut descr = String::from("{");
     descr.push_str(crates[0].as_ref());
@@ -804,6 +807,7 @@ impl<'a> Builder<'a> {
                 llvm::Enzyme,
                 llvm::RustOffload,
                 llvm::CrtBeginEnd,
+                llvm::Tpde,
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
                 tool::ReproCheck,
@@ -811,7 +815,7 @@ impl<'a> Builder<'a> {
                 tool::LlvmBitcodeLinker,
                 tool::RustcPerf,
                 tool::WasmComponentLd,
-                tool::LldWrapper
+                tool::LldWrapper,
             ),
             Kind::Clippy => describe!(
                 clippy::Std,
@@ -884,6 +888,7 @@ impl<'a> Builder<'a> {
                 test::MirOpt,
                 test::CodegenLlvm,
                 test::CodegenUnits,
+                test::AssemblyGcc,
                 test::AssemblyLlvm,
                 test::Incremental,
                 test::Debuginfo,
@@ -923,6 +928,7 @@ impl<'a> Builder<'a> {
                 test::Clippy,
                 test::CompiletestTest,
                 test::StdarchVerify,
+                test::StdarchGenCheck,
                 test::CrateRunMakeSupport,
                 test::CrateBuildHelper,
                 test::RustdocJSStd,
@@ -962,6 +968,7 @@ impl<'a> Builder<'a> {
                 doc::CargoBook,
                 doc::Clippy,
                 doc::ClippyBook,
+                doc::CompilerWithTools,
                 doc::Miri,
                 doc::EmbeddedBook,
                 doc::EditionGuide,
@@ -1006,7 +1013,7 @@ impl<'a> Builder<'a> {
                 dist::BuildManifest,
                 dist::ReproducibleArtifacts,
                 dist::GccDev,
-                dist::Gcc
+                dist::Gcc,
             ),
             Kind::Install => describe!(
                 install::Docs,
@@ -1116,10 +1123,9 @@ impl<'a> Builder<'a> {
             Subcommand::Run { .. } => (Kind::Run, &paths[..]),
             Subcommand::Clean { .. } => (Kind::Clean, &paths[..]),
             Subcommand::Format { .. } => (Kind::Format, &[][..]),
-            Subcommand::Setup { profile: ref path } => (
-                Kind::Setup,
-                path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
-            ),
+            Subcommand::Setup { profile: ref path } => {
+                (Kind::Setup, path.as_ref().map_or([].as_slice(), std::slice::from_ref))
+            }
             Subcommand::Vendor { .. } => (Kind::Vendor, &paths[..]),
             Subcommand::Perf { .. } => (Kind::Perf, &paths[..]),
         };

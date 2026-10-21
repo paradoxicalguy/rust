@@ -1,16 +1,15 @@
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
 use rustc_middle::ty::{
     self, ClosureKind, GenericArgsRef, Instance, PseudoCanonicalInput, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
-use rustc_span::sym;
+use rustc_span::{bug, sym};
 use rustc_trait_selection::traits;
 use tracing::debug;
 use traits::translate_args;
@@ -176,7 +175,8 @@ fn resolve_associated_item<'tcx>(
                 return Ok(None);
             }
 
-            let typing_env = typing_env.with_post_analysis_normalized(tcx);
+            let PseudoCanonicalInput { typing_env, value: rcvr_args } =
+                typing_env.with_post_analysis_normalized_invalidating_rigid_aliases(tcx, rcvr_args);
             let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
             let args = rcvr_args.rebase_onto(tcx, trait_def_id, impl_data.args);
             let args = translate_args(

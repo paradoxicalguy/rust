@@ -8,7 +8,8 @@ use rustc_type_ir::solve::{
     RerunNonErased, RerunReason, RerunResultExt,
 };
 use rustc_type_ir::{
-    self as ty, FieldInfo, Interner, NormalizesTo, PredicateKind, Region, Unnormalized, Upcast as _,
+    self as ty, Const, FieldInfo, Interner, NormalizesTo, PredicateKind, Region, Unnormalized,
+    Upcast as _,
 };
 use tracing::instrument;
 
@@ -182,6 +183,7 @@ where
     fn fast_reject_assumption(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
+        _goal_lang_item: Option<SolverTraitLangItem>,
         assumption: I::Clause,
     ) -> Result<(), NoSolution> {
         let alias_def_id = match goal.predicate.alias.kind {
@@ -438,7 +440,7 @@ where
             let term = match target_item_kind {
                 ty::AliasTermKind::ProjectionTy { .. } => {
                     let t = cx.type_of(target_item_def_id).instantiate(cx, target_args);
-                    let t = ecx.normalize(GoalSource::Misc, goal.param_env, t)?;
+                    let t = ecx.normalize(goal.param_env, t)?;
                     t.into()
                 }
                 ty::AliasTermKind::ProjectionConst { def_id }
@@ -446,7 +448,7 @@ where
                         cx.const_of_item(ty::AliasConstKind::Projection { def_id }) =>
                 {
                     let c = c.instantiate(cx, target_args);
-                    let c = ecx.normalize(GoalSource::Misc, goal.param_env, c)?;
+                    let c = ecx.normalize(goal.param_env, c)?;
                     c.into()
                 }
                 ty::AliasTermKind::ProjectionConst { .. } => {

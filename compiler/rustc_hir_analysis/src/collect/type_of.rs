@@ -7,8 +7,7 @@ use rustc_hir::{self as hir, AmbigArg, HirId};
 use rustc_middle::ty::print::{with_forced_trimmed_paths, with_types_for_suggestion};
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, DefiningScopeKind, IsSuggestable, Ty, TyCtxt, TypeVisitableExt};
-use rustc_middle::{bug, span_bug};
-use rustc_span::{DUMMY_SP, Ident, Span};
+use rustc_span::{DUMMY_SP, Ident, Span, bug, span_bug};
 use tracing::instrument;
 
 use super::{HirPlaceholderCollector, ItemCtxt, bad_placeholder};
@@ -60,10 +59,6 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
         None => {}
     }
 
-    let hir_id = tcx.local_def_id_to_hir_id(def_id);
-
-    let icx = ItemCtxt::new(tcx, def_id);
-
     let new_bound_fn_def = |hir: HirId, did| {
         let args = ty::GenericArgs::identity_for_item(tcx, def_id);
         Ty::new_fn_def(
@@ -81,7 +76,21 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
         )
     };
 
-    let output = match tcx.hir_node(hir_id) {
+    let hir_id = tcx.local_def_id_to_hir_id(def_id);
+    let hir_node = tcx.hir_node(hir_id);
+    let def_id = match hir_node {
+        // For generic params, we lower in the context of the overarching item to be able to resolve
+        // type-relative paths in type param defaults & const param types.
+        // FIXME: Remove this special case again & simply set the `Generics.parent` for generic
+        //        params in `generics_of` similar to struct fields. However, that's blocked on the
+        //        removal of GCE in favor of mGCA. Doing this change now would introduce tons of
+        //        query cycles for GCE.
+        Node::GenericParam(_) => tcx.local_parent(def_id),
+        _ => def_id,
+    };
+    let icx = ItemCtxt::new(tcx, def_id);
+
+    let output = match hir_node {
         Node::TraitItem(item) => match item.kind {
             TraitItemKind::Fn(_, _) => new_bound_fn_def(item.hir_id(), def_id.to_def_id()),
             TraitItemKind::Const(ty, rhs) => rhs
@@ -105,7 +114,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
                 .unwrap_or_else(|| icx.lower_ty(ty)),
             TraitItemKind::Type(_, Some(ty)) => icx.lower_ty(ty),
             TraitItemKind::Type(_, None) => {
-                span_bug!(item.span, "associated type missing default");
+                span_bug!(item.span, "type_of: associated type missing default");
             }
         },
 
@@ -208,7 +217,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
             | ItemKind::ExternCrate(..)
             | ItemKind::Use(..)
             | ItemKind::TestBinderConstraints { .. } => {
-                span_bug!(item.span, "compute_type_of_item: unexpected item type: {:?}", item.kind);
+                span_bug!(item.span, "type_of: unexpected item kind: {:?}", item.kind);
             }
         },
 
@@ -257,21 +266,17 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
             GenericParamKind::Const { ty, .. } => {
                 let lowered_ty = icx.lower_ty(ty);
                 if !tcx.features().generic_const_parameter_types() && lowered_ty.has_param() {
-                    let guar = tcx
-                        .dcx()
-                        .create_err(ParamInTyOfConstParam { span: ty.span, ty: lowered_ty })
-                        .emit();
+                    let guar =
+                        tcx.dcx().emit_err(ParamInTyOfConstParam { span: ty.span, ty: lowered_ty });
                     Ty::new_error(tcx, guar)
                 } else {
                     lowered_ty
                 }
             }
-            x => bug!("unexpected non-type Node::GenericParam: {:?}", x),
+            _ => bug!("type_of: unexpected node kind {hir_node:?}"),
         },
 
-        x => {
-            bug!("unexpected sort of node in type_of(): {:?}", x);
-        }
+        node => bug!("type_of: unexpected node kind: {node:?}"),
     };
     if let Err(e) = icx.check_tainted_by_errors()
         && !output.references_error()
@@ -544,7 +549,7 @@ fn infer_placeholder_type<'tcx>(
                 }
             }
 
-            diag.emit()
+            diag.emit_err()
         });
     Ty::new_error(tcx, guar)
 }

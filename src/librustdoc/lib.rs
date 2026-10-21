@@ -6,13 +6,14 @@
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
 #![feature(deref_patterns)]
+#![feature(exitcode_exit_method)]
 #![feature(file_buffered)]
 #![feature(formatting_options)]
 #![feature(iter_intersperse)]
 #![feature(iter_order_by)]
+#![feature(iter_partition_in_place)]
 #![feature(rustc_private)]
 #![feature(test)]
-#![feature(trim_prefix_suffix)]
 #![feature(variant_count)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
@@ -30,6 +31,7 @@
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
+extern crate rustc_attr_ir;
 extern crate rustc_attr_parsing;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -1019,8 +1021,6 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
             }
 
             cache.crate_version = crate_version;
-
-            rustc_interface::passes::emit_delayed_lints(tcx);
 
             if render_opts.dep_info().is_some() {
                 rustc_interface::passes::write_dep_info(tcx);

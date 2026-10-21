@@ -291,8 +291,11 @@ impl<'a> AstValidator<'a> {
         });
     }
 
-    fn check_decl_no_pat(decl: &FnDecl, mut report_err: impl FnMut(Span, Option<Ident>, bool)) {
-        for Param { pat, .. } in &decl.inputs {
+    fn check_decl_no_pat(
+        fn_inputs: &[Param],
+        mut report_err: impl FnMut(Span, Option<Ident>, bool),
+    ) {
+        for Param { pat, .. } in fn_inputs {
             match pat.kind {
                 PatKind::Missing | PatKind::Ident(BindingMode::NONE, _, None) | PatKind::Wild => {}
                 PatKind::Ident(BindingMode::MUT, ident, None) => {
@@ -396,8 +399,9 @@ impl<'a> AstValidator<'a> {
         self.check_decl_num_args(fn_decl);
         let c_variadic_span = self.check_decl_cvariadic_pos(fn_decl);
         self.check_decl_splatting(fn_decl, c_variadic_span, splat_semantic);
-        self.check_decl_attrs(fn_decl);
-        self.check_decl_self_param(fn_decl, self_semantic);
+        self.check_decl_attrs(&fn_decl.inputs);
+        self.check_decl_self_param(&fn_decl.inputs, self_semantic);
+        self.check_decl_const_param(&fn_decl.inputs);
     }
 
     /// Emits fatal error if function declaration has more than `u16::MAX` arguments
@@ -514,10 +518,9 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    fn check_decl_attrs(&self, fn_decl: &FnDecl) {
+    fn check_decl_attrs(&self, fn_inputs: &[Param]) {
         use SyntheticAttr::*;
-        fn_decl
-            .inputs
+        fn_inputs
             .iter()
             .flat_map(|i| i.attrs.as_ref())
             .filter(|attr| match &attr.kind {
@@ -544,10 +547,24 @@ impl<'a> AstValidator<'a> {
             });
     }
 
-    fn check_decl_self_param(&self, fn_decl: &FnDecl, self_semantic: SelfSemantic) {
-        if let (SelfSemantic::No, [param, ..]) = (self_semantic, &*fn_decl.inputs) {
+    fn check_decl_self_param(&self, fn_inputs: &[Param], self_semantic: SelfSemantic) {
+        if let (SelfSemantic::No, [param, ..]) = (self_semantic, fn_inputs) {
             if param.is_self() {
                 self.dcx().emit_err(diagnostics::FnParamForbiddenSelf { span: param.span });
+            }
+        }
+    }
+
+    fn check_decl_const_param(&self, fn_inputs: &[Param]) {
+        for param in fn_inputs {
+            if param.has_const_keyword && !param.is_const_param() {
+                let span = if matches!(param.pat.kind, PatKind::Missing) {
+                    param.span
+                } else {
+                    param.pat.span
+                };
+
+                self.dcx().emit_err(diagnostics::InvalidConstParam { span });
             }
         }
     }
@@ -1200,7 +1217,7 @@ impl<'a> AstValidator<'a> {
                     SelfSemantic::No,
                     SplatSemantic::from_extern(bfty.ext),
                 );
-                Self::check_decl_no_pat(&bfty.decl, |span, _, _| {
+                Self::check_decl_no_pat(&bfty.decl.inputs, |span, _, _| {
                     self.dcx().emit_err(diagnostics::PatternFnPointer { span });
                 });
                 if let Extern::Implicit(extern_span) = bfty.ext {
@@ -2009,7 +2026,7 @@ impl Visitor<'_> for AstValidator<'_> {
 
         // Functions without bodies cannot have patterns.
         if let FnKind::Fn(ctxt, _, Fn { body: None, sig, .. }) = fk {
-            Self::check_decl_no_pat(&sig.decl, |span, ident, mut_ident| {
+            Self::check_decl_no_pat(&sig.decl.inputs, |span, ident, mut_ident| {
                 if mut_ident && matches!(ctxt, FnCtxt::Assoc(_)) {
                     if let Some(ident) = ident {
                         let is_foreign = matches!(ctxt, FnCtxt::Foreign);
@@ -2207,6 +2224,17 @@ impl Visitor<'_> for AstValidator<'_> {
             Some(TildeConstReason::AnonConst { span: anon_const.value.span }),
             |this| visit::walk_anon_const(this, anon_const),
         )
+    }
+
+    fn visit_path_segment(&mut self, seg: &PathSegment) -> Self::Result {
+        if let Some(Parenthesized(args)) = &seg.args {
+            self.check_decl_self_param(&args.inputs, SelfSemantic::No);
+            self.check_decl_attrs(&args.inputs);
+            Self::check_decl_no_pat(&args.inputs, |span, _, _| {
+                self.dcx().emit_err(diagnostics::PatternParenthesizedArgList { span });
+            });
+        }
+        visit::walk_path_segment(self, seg);
     }
 }
 

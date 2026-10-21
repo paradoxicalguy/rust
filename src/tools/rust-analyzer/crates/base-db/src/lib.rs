@@ -19,6 +19,7 @@ use std::{
     cell::RefCell,
     hash::BuildHasherDefault,
     panic,
+    str::FromStr as _,
     sync::{Once, atomic::AtomicUsize},
 };
 
@@ -29,7 +30,7 @@ pub use crate::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
         CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CratesIdMap, CratesMap,
         DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
-        ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, UniqueCrateData,
+        ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
     },
 };
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -327,7 +328,7 @@ impl CrateWorkspaceData {
 }
 
 pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<ReleaseChannel> {
-    krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre))
+    krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
 #[salsa::input(singleton, debug)]

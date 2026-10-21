@@ -5,20 +5,25 @@ use rustc_type_ir::inherent::*;
 use rustc_type_ir::solve::{Goal, QueryInput};
 use rustc_type_ir::{
     self as ty, Canonical, CanonicalParamEnvCacheEntry, CanonicalVarKind, CanonicalizerState,
-    Flags, InferCtxtLike, Interner, PlaceholderConst, PlaceholderType, PredicateProxy, Region,
-    TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    Const, Flags, InferCtxtLike, Interner, PlaceholderConst, PlaceholderType, PredicateProxy,
+    Region, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
 };
 use thin_vec::ThinVec;
 
 use crate::delegate::SolverDelegate;
 
 /// Does this have infer/placeholder/param, free regions or ReErased?
+// We're explicitly checking for fresh types and consts to trigger an
+// assert if they ever leak into the trait solver. They should never
+// exist with the new solver.
 const NEEDS_CANONICAL: TypeFlags = TypeFlags::from_bits(
     TypeFlags::HAS_INFER.bits()
         | TypeFlags::HAS_PLACEHOLDER.bits()
         | TypeFlags::HAS_PARAM.bits()
         | TypeFlags::HAS_FREE_REGIONS.bits()
-        | TypeFlags::HAS_RE_ERASED.bits(),
+        | TypeFlags::HAS_RE_ERASED.bits()
+        | TypeFlags::HAS_TY_FRESH.bits()
+        | TypeFlags::HAS_CT_FRESH.bits(),
 )
 .unwrap();
 
@@ -173,14 +178,12 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                         delegate,
                         CanonicalizeMode::Input(CanonicalizeInputKind::Predicate),
                     );
-                    rest_canonicalizer.state.variables.extend(e.variables.iter().copied());
-                    rest_canonicalizer.state.var_kinds.extend(e.var_kinds.iter().copied());
-                    // SAFETY: The iterated elements go straight back into a hashmap.
-                    #[allow(rustc::potential_query_instability)]
+                    rest_canonicalizer.state.variables.clone_from(&e.variables);
+                    rest_canonicalizer.state.var_kinds.clone_from(&e.var_kinds);
                     rest_canonicalizer
                         .state
                         .variable_lookup_table
-                        .extend(e.variable_lookup_table.iter().map(|(&arg, &idx)| (arg, idx)));
+                        .clone_from(&e.variable_lookup_table);
                     (e.param_env, rest_canonicalizer)
                 }
             })
@@ -322,7 +325,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
             ty::Infer(i) => match i {
                 ty::TyVar(vid) => {
                     debug_assert_eq!(
-                        self.delegate.opportunistic_resolve_ty_var(vid),
+                        self.delegate.shallow_resolve_ty_var(vid),
                         t,
                         "ty vid should have been resolved fully before canonicalization"
                     );
@@ -339,7 +342,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                 }
                 ty::IntVar(vid) => {
                     debug_assert_eq!(
-                        self.delegate.opportunistic_resolve_int_var(vid),
+                        self.delegate.shallow_resolve_int_var(vid),
                         t,
                         "ty vid should have been resolved fully before canonicalization"
                     );
@@ -347,7 +350,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                 }
                 ty::FloatVar(vid) => {
                     debug_assert_eq!(
-                        self.delegate.opportunistic_resolve_float_var(vid),
+                        self.delegate.shallow_resolve_float_var(vid),
                         t,
                         "ty vid should have been resolved fully before canonicalization"
                     );
@@ -489,7 +492,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
 
             ty::ReVar(vid) => {
                 debug_assert_eq!(
-                    self.delegate.opportunistic_resolve_lt_var(vid),
+                    self.delegate.shallow_resolve_region_var(vid),
                     r,
                     "region vid should have been resolved fully before canonicalization"
                 );
@@ -501,7 +504,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
                         ))
                     }
                     CanonicalizeMode::Response { .. } => {
-                        CanonicalVarKind::Region(self.delegate.universe_of_lt(vid).unwrap())
+                        CanonicalVarKind::Region(self.delegate.universe_of_region(vid).unwrap())
                     }
                 }
             }
@@ -525,7 +528,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
         }
     }
 
-    fn fold_const(&mut self, c: I::Const) -> I::Const {
+    fn fold_const(&mut self, c: Const<I>) -> Const<I> {
         if !c.flags().intersects(NEEDS_CANONICAL) {
             return c;
         }
@@ -534,7 +537,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
             ty::ConstKind::Infer(i) => match i {
                 ty::InferConst::Var(vid) => {
                     debug_assert_eq!(
-                        self.delegate.opportunistic_resolve_ct_var(vid),
+                        self.delegate.shallow_resolve_const_var(vid),
                         c,
                         "const vid should have been resolved fully before canonicalization"
                     );
@@ -544,7 +547,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
                             CanonicalVarKind::Const(ty::UniverseIndex::ROOT)
                         }
                         CanonicalizeMode::Response { .. } => {
-                            CanonicalVarKind::Const(self.delegate.universe_of_ct(vid).unwrap())
+                            CanonicalVarKind::Const(self.delegate.universe_of_const(vid).unwrap())
                         }
                     }
                 }

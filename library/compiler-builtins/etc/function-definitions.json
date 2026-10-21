@@ -233,6 +233,18 @@
         ],
         "type": "f32"
     },
+    "exp2m1": {
+        "sources": [
+            "libm/src/math/exp2m1.rs"
+        ],
+        "type": "f64"
+    },
+    "exp2m1f": {
+        "sources": [
+            "libm/src/math/exp2m1f.rs"
+        ],
+        "type": "f32"
+    },
     "expf": {
         "sources": [
             "libm/src/math/expf.rs"
@@ -985,6 +997,7 @@
     "sqrt": {
         "sources": [
             "libm/src/math/arch/aarch64/sqrt.rs",
+            "libm/src/math/arch/arm/sqrt.rs",
             "libm/src/math/arch/loongarch/sqrt.rs",
             "libm/src/math/arch/wasm32/sqrt.rs",
             "libm/src/math/arch/x86/sqrt.rs",
@@ -996,6 +1009,7 @@
     "sqrtf": {
         "sources": [
             "libm/src/math/arch/aarch64/sqrt.rs",
+            "libm/src/math/arch/arm/sqrt.rs",
             "libm/src/math/arch/loongarch/sqrt.rs",
             "libm/src/math/arch/wasm32/sqrt.rs",
             "libm/src/math/arch/x86/sqrt.rs",

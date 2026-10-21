@@ -5,12 +5,12 @@ use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
-use rustc_middle::bug;
 use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
 use rustc_middle::ty::{
     self, GenericArg, GenericArgKind, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
+use rustc_span::bug;
 use tracing::debug;
 
 pub(super) fn mangle<'tcx>(
@@ -487,19 +487,9 @@ impl<'tcx> PrettyPrinter<'tcx> for LegacySymbolMangler<'tcx> {
         false
     }
 
-    // Identical to `PrettyPrinter::comma_sep` except there is no space after each comma.
-    fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
-    where
-        T: Print<Self>,
-    {
-        if let Some(first) = elems.next() {
-            first.print(self)?;
-            for elem in elems {
-                self.write_str(",")?;
-                elem.print(self)?;
-            }
-        }
-        Ok(())
+    // In symbol mangling, there is no space after the commas in a comma-separated list.
+    fn comma_sep_has_space(&self) -> bool {
+        false
     }
 
     fn generic_delimiters(
