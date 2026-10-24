@@ -10,7 +10,7 @@ pub fn write_bootstrap_toml(env_root: &Path, target: Option<&str>) -> Result<()>
     let content = format!(
         r#"
 [llvm]
-download-ci-llvm = false
+download-ci-llvm = true
 
 [build]
 optimized-compiler-builtins = true

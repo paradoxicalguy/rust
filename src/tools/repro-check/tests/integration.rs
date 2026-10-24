@@ -22,7 +22,7 @@ mod tests {
         let temp_b = TempDir::new().unwrap();
         let excludes = HashSet::new();
         let report =
-            compare_directories(temp_a.path(), temp_b.path(), "test-host", &excludes).unwrap();
+            compare_directories(temp_a.path(), temp_b.path(), "test-host", &excludes, false, temp_a.path()).unwrap();
         assert_eq!(report.total_files, 0);
         assert!(report.mismatches.is_empty());
         assert!(report.ignored_files.is_empty());
@@ -41,7 +41,7 @@ mod tests {
         let mut excludes = HashSet::new();
         excludes.insert(".log".to_string());
 
-        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes).unwrap();
+        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes, false, temp_a.path()).unwrap();
 
         assert_eq!(report.total_files, 2);
         assert_eq!(report.ignored_files.len(), 1);
@@ -62,7 +62,7 @@ mod tests {
         temp_b.child("diff.txt").write_str("version two").unwrap();
 
         let excludes = HashSet::new();
-        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes).unwrap();
+        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes, false, temp_a.path()).unwrap();
 
         assert_eq!(report.total_files, 1);
         assert_eq!(report.mismatches.len(), 1);
@@ -79,7 +79,7 @@ mod tests {
         let mut excludes = HashSet::new();
         excludes.insert("metrics.json".to_string());
 
-        let report = compare_directories(temp_a.path(), temp_a.path(), "host", &excludes).unwrap();
+        let report = compare_directories(temp_a.path(), temp_a.path(), "host", &excludes, false, temp_a.path()).unwrap();
         assert_eq!(report.ignored_files.len(), 1);
     }
 
@@ -92,7 +92,7 @@ mod tests {
         temp_b.child("file.bin").write_binary(b"\x00\x01\x03").unwrap();
 
         let excludes = HashSet::new();
-        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes).unwrap();
+        let report = compare_directories(temp_a.path(), temp_b.path(), "host", &excludes, false, temp_a.path()).unwrap();
 
         assert_eq!(report.mismatches.len(), 1);
     }

@@ -17,7 +17,7 @@ jobs:
 
       - name: write bootstrap.toml
         run: |
-          printf 'change-id = "ignore"\n[llvm]\ndownload-ci-llvm = false\n' > bootstrap.toml
+          printf 'change-id = "ignore"\n[llvm]\ndownload-ci-llvm = true\n' > bootstrap.toml
           cat bootstrap.toml
 
       - name: disk usage before

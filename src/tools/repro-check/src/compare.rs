@@ -131,6 +131,8 @@ pub fn zls_root_diff (path_a: &Path, path_b: &Path, rustc_a: &Path, rustc_b: &Pa
      
     let crates_a = parse_zls_output(&text_a);
     let crates_b = parse_zls_output(&text_b);
+    let parsed_a_count = crates_a.len();
+    let parsed_b_count = crates_b.len();
     
     let mut crates = Vec::new();
     for entry_a in crates_a {
@@ -147,30 +149,52 @@ pub fn zls_root_diff (path_a: &Path, path_b: &Path, rustc_a: &Path, rustc_b: &Pa
             crates.push(entry);
         }
     }
-    Some(ZlsRootReport { crates, status: "ok".to_string(), })
+    let status = if crates.is_empty() {
+        format!(
+            "no matching crate rows (parsed A: {}, B: {})\nA stdout (first 2000 chars):\n{}\nB stdout (first 2000 chars):\n{}",
+            parsed_a_count,
+            parsed_b_count,
+            text_a.chars().take(2000).collect::<String>(),
+            text_b.chars().take(2000).collect::<String>(),
+        )
+    } else {
+        "ok".to_string()
+    };
+    Some(ZlsRootReport { crates, status })
     
     
 }
 
 pub fn parse_zls_output(text: &str) -> Vec<CrateEntry> {
     let mut crates = Vec::new();
+
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 11 {
+
+        if tokens.len() < 9
+            || tokens[0].parse::<u32>().is_err()
+            || tokens.get(2) != Some(&"hash")
+            || tokens.get(4) != Some(&"host_hash")
+            || tokens.get(6) != Some(&"kind")
+        {
             continue;
         }
-        if tokens[0].parse::<u32>().is_err() {
-            continue;
-        }
+
+        let linkage = match tokens.get(9) {
+            Some(&"linkage") => tokens[10..].join(" "),
+            _ => "not listed".to_string(),
+        };
+
         crates.push(CrateEntry {
             name: tokens[1].to_string(),
             hash_a: tokens[3].to_string(),
             hash_b: tokens[3].to_string(),
             kind: tokens[7].to_string(),
-            linkage: tokens[10].to_string(),
+            linkage,
             hash_match: true,
         });
     }
+
     crates
 }
 
@@ -409,10 +433,10 @@ pub fn compare_directories(
         };
         let dwarf_path_diff = diff_dwarf_paths(&dir_a.join(&rel_path), &dir_b.join(&rel_path));
 
-        let normalized_hash_a = None;
-        let normalized_hash_b = None;
-        let normalized_match = None;
-        let normalization_notes = Vec::new();
+        let mut normalized_hash_a = None;
+        let mut normalized_hash_b = None;
+        let mut normalized_match = None;
+        let mut normalization_notes = Vec::new();
 
         // --- Windows PE normalization ---
         #[cfg(windows)]
@@ -562,6 +586,12 @@ pub fn generate_html_report(report: &ComparisonReport, output_path: &Path) -> Re
                 ));
             }
             if let Some(zls) = &mismatch.zls_root_output {
+                if zls.status != "ok" {
+                    html.push_str(&format!(
+                        r#"<tr class="mismatch"><td colspan="3"><details open><summary>rustc -Zls=root diagnostics</summary><pre>{}</pre></details></td></tr>"#,
+                        html_escape(&zls.status)
+                    ));
+                }
                 let differing: Vec<&CrateEntry> = zls.crates.iter().filter(|c| !c.hash_match).collect();
                 let matching = zls.crates.iter().filter(|c| c.hash_match).count();
                 
@@ -789,4 +819,40 @@ pub fn compute_normalized_pe_hash(path: &Path) -> Result<PeNormalizationResult> 
         normalized_hash: hex::encode(hasher.finalize()),
         notes,
     })
+}
+
+#[cfg(test)]
+mod parse_zls_output_tests {
+    use super::parse_zls_output;
+
+    #[test]
+    fn parses_dependency_without_linkage() {
+        let output =
+            "Crate info:\n=External Dependencies=\n1 std hash abc123 host_hash None kind Explicit public\n";
+
+        let crates = parse_zls_output(output);
+
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].name, "std");
+        assert_eq!(crates[0].hash_a, "abc123");
+        assert_eq!(crates[0].kind, "Explicit");
+        assert_eq!(crates[0].linkage, "not listed");
+    }
+
+    #[test]
+    fn parses_dependency_with_linkage() {
+        let output =
+            "1 std hash abc123 host_hash None kind Explicit public linkage Some(Static)\n";
+
+        let crates = parse_zls_output(output);
+
+        assert_eq!(crates.len(), 1);
+        assert_eq!(crates[0].linkage, "Some(Static)");
+    }
+
+    #[test]
+    fn ignores_headers_and_malformed_rows() {
+        let output = "Crate info:\n=External Dependencies=\ninvalid row\n";
+        assert!(parse_zls_output(output).is_empty());
+    }
 }
