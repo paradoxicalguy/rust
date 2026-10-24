@@ -87,6 +87,10 @@ pub fn diffoscope_diff (path_a: &Path, path_b: &Path) -> Option<String> {
     }
 }
 
+fn rmeta_for(path: &Path) -> Option<PathBuf> {
+    let candidate = path.with_extension("rmeta");
+    if candidate.exists() { Some(candidate) } else { None }
+}
 pub fn zls_root_diff (path_a: &Path, path_b: &Path, rustc_a: &Path, rustc_b: &Path) -> Option<ZlsRootReport> {
     let out_a = match Command::new(rustc_a)
     .arg("-Zls=root")
@@ -420,12 +424,15 @@ pub fn compare_directories(
             None
         };
 
-        let zls_root_output = zls_root_diff(
-            &dir_a.join(&rel_path),
-            &dir_b.join(&rel_path),
-            &dir_a.join("bin/rustc"),
-            &dir_b.join("bin/rustc"),
-        );
+        let zls_root_output = match (
+            rmeta_for(&dir_a.join(&rel_path)),
+            rmeta_for(&dir_b.join(&rel_path)),
+        ) {
+            (Some(ra), Some(rb)) => {
+                zls_root_diff(&ra, &rb, &dir_a.join("bin/rustc"), &dir_b.join("bin/rustc"))
+            }
+            _ => None,
+        };
         let root_cause_crates = if let Some(ref zls) = zls_root_output {
             find_root_cause_crates(zls, src_root)
         } else {

@@ -54,6 +54,7 @@ jobs:
           readelf -SW "$A" > sections_a.txt
           readelf -SW "$B" > sections_b.txt
           diff sections_a.txt sections_b.txt > sections.diff || true
+          find build/repro_workspace/build-a -name 'librustc_driver-*' | tee driver_locations.txt
           mkdir -p driver_files
           cp "$A" driver_files/driver_a.so
           cp "$B" driver_files/driver_b.so
@@ -71,6 +72,7 @@ jobs:
             **/*repro_report*.html
             repro_run.log
             diffoscope_driver.txt
+            driver_locations.txt
             sections.diff
             sections_a.txt
             driver_files/*.so
