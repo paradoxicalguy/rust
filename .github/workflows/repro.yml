@@ -44,20 +44,17 @@ jobs:
       - name: diffoscope on librustc_driver
         if: always()
         run: |
-          sudo apt-get install -y diffoscope-minimal binutils || pip install diffoscope
           A=$(find build/repro_workspace/build-a -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
           B=$(find build/repro_workspace/build-b -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
           echo "A=$A"; echo "B=$B"
           ls -l "$A" "$B"
           cmp "$A" "$B" | head -1 || true
-          diffoscope --text diffoscope_driver.txt --max-report-size 20000000 "$A" "$B" || true
+          strings -a "$A" | grep -F 'build-a' | sort -u | head -50 > paths_a.txt || true
+          strings -a "$B" | grep -F 'build-b' | sort -u | head -50 > paths_b.txt || true
           readelf -SW "$A" > sections_a.txt
           readelf -SW "$B" > sections_b.txt
           diff sections_a.txt sections_b.txt > sections.diff || true
           find build/repro_workspace/build-a -name 'librustc_driver-*' | tee driver_locations.txt
-          mkdir -p driver_files
-          cp "$A" driver_files/driver_a.so
-          cp "$B" driver_files/driver_b.so
       - name: disk usage after
         if: always()
         run: df -h
@@ -75,5 +72,6 @@ jobs:
             driver_locations.txt
             sections.diff
             sections_a.txt
-            driver_files/*.so
+            paths_a.txt
+            paths_b.txt
           if-no-files-found: warn
