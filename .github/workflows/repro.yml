@@ -12,14 +12,20 @@ jobs:
       - name: checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           submodules: recursive
 
+      - name: make HEAD a merge on top of upstream
+        run: |
+          BASE=$(git rev-list --author-date-order --author='bors@rust-lang.org' -n1 HEAD)
+          echo "upstream base: $BASE"
+          git checkout -q "$BASE"
+          git -c user.name=ci -c user.email=ci@example.com merge --no-ff --no-edit "$GITHUB_SHA"
+          git show -s --format='%H parents: %P' HEAD
       - name: write bootstrap.toml
         run: |
           printf 'change-id = "ignore"\n[llvm]\ndownload-ci-llvm = true\n' > bootstrap.toml
           cat bootstrap.toml
-
       - name: disk usage before
         run: df -h
 
