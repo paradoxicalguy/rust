@@ -49,6 +49,9 @@ jobs:
           echo "A=$A"; echo "B=$B"
           ls -l "$A" "$B"
           cmp "$A" "$B" | head -1 || true
+          objcopy -O binary --only-section=.debug_line "$A" a_debug_line.bin || true
+          objcopy -O binary --only-section=.debug_line "$B" b_debug_line.bin || true
+          grep -c 'extra1' b_debug_line.bin > debug_line_extra_count_b.txt || true
           strings -a "$A" | grep -F 'build-a' | sort -u | head -50 > paths_a.txt || true
           strings -a "$B" | grep -F 'build-b' | sort -u | head -50 > paths_b.txt || true
           readelf -SW "$A" > sections_a.txt
@@ -74,4 +77,7 @@ jobs:
             sections_a.txt
             paths_a.txt
             paths_b.txt
+            a_debug_line.bin
+            b_debug_line.bin
+            debug_line_extra_count_b.txt
           if-no-files-found: warn
