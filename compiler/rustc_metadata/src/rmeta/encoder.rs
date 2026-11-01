@@ -144,7 +144,7 @@ impl<'a, 'tcx, T> Encodable<EncodeContext<'a, 'tcx>> for LazyArray<T> {
 
 impl<'a, 'tcx, Ie, Id, T> Encodable<EncodeContext<'a, 'tcx>> for LazyTable<Ie, Id, T> {
     fn encode(&self, e: &mut EncodeContext<'a, 'tcx>) {
-        e.emit_usize(self.width);
+        e.emit_usize(self.width_and_sparse);
         e.emit_usize(self.len);
         e.emit_lazy_distance(self.position);
     }
@@ -2476,7 +2476,7 @@ fn prefetch_mir(tcx: TyCtxt<'_>) {
     }
 
     let reachable_set = tcx.reachable_set(());
-    par_for_each_in(tcx.mir_keys(()), |&&def_id| {
+    par_for_each_in(tcx.mir_keys(()).as_slice(), |&def_id| {
         if tcx.is_trivial_const(def_id) {
             return;
         }
