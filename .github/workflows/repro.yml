@@ -44,9 +44,13 @@ jobs:
       - name: diffoscope on librustc_driver
         if: always()
         run: |
-          A=$(find build/repro_workspace/build-a -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
-          B=$(find build/repro_workspace/build-b -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
+          A=$(find ../rust-repro-workspace/build-a -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
+          B=$(find ../rust-repro-workspace/build-b -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
           echo "A=$A"; echo "B=$B"
+          if [[ -z "$A" || -z "$B" ]]; then
+            echo "One or both stage2 drivers are missing; skipping comparison."
+            exit 0
+          fi
           ls -l "$A" "$B"
           cmp "$A" "$B" | head -1 || true
           objcopy -O binary --only-section=.debug_line "$A" a_debug_line.bin || true
@@ -57,7 +61,7 @@ jobs:
           readelf -SW "$A" > sections_a.txt
           readelf -SW "$B" > sections_b.txt
           diff sections_a.txt sections_b.txt > sections.diff || true
-          find build/repro_workspace/build-a -name 'librustc_driver-*' | tee driver_locations.txt
+          find ../rust-repro-workspace/build-a -name 'librustc_driver-*' | tee driver_locations.txt
       - name: disk usage after
         if: always()
         run: df -h

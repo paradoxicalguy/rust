@@ -84,7 +84,10 @@ fn main() -> Result<()> {
     let src_root = std::fs::canonicalize(&args.src_root).context("Bad source root path")?;
     info!("Repro check starting from {:?}", src_root);
 
-    let workspace = src_root.join("build/repro_workspace");
+    let workspace = src_root
+        .parent()
+        .context("Source root has no parent")?
+        .join("rust-repro-workspace");
     if args.clean {
         fs_utils::clean_workspace(&workspace)?;
     }
