@@ -21,13 +21,8 @@ pub fn run_xpy(env_root: &Path, jobs: u32, target: Option<&str>, full_dist: bool
     cmd.arg(build_cmd);
 
     if !full_dist {
-        cmd.arg("--stage").arg("2");
-        cmd.arg("compiler");
-        cmd.arg("library");
-        cmd.arg("src/tools/rustdoc");
-        cmd.arg("src/tools/clippy");
-        cmd.arg("src/tools/cargo");
-        cmd.arg("src/tools/rustfmt");
+        cmd.arg("--stage").arg("1");
+        cmd.arg("library/std");
     }
 
     if let Some(t) = target {

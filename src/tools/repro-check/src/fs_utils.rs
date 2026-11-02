@@ -91,7 +91,7 @@ fn clone_source_tree(src: &Path, dest: &Path) -> Result<()> {
     let status = std::process::Command::new("git")
         .arg("-C")
         .arg(dest)
-        .args(["submodule", "update", "--init", "--recursive", "--jobs", "4"])
+        .args(["submodule", "update", "--init", "--jobs", "4", "src/llvm-project", "library/backtrace"])
         .status()
         .context("Failed to initialize submodules")?;
 

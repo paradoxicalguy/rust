@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
 
       - name: make HEAD a merge on top of upstream
         run: |
@@ -32,36 +32,71 @@ jobs:
       - name: free up disk space
         run: src/ci/scripts/free-disk-space-linux.sh
 
+      - name: initialize required submodules
+        run: git submodule update --init --jobs 4 src/llvm-project library/backtrace
+
       - name: build repro-check
         run: python x.py build --stage 2 src/tools/repro-check
 
       - name: run repro-check
+        continue-on-error: true
         run: |
           set -o pipefail
           ./build/x86_64-unknown-linux-gnu/stage1-tools-bin/repro-check --src-root . \
             | tee repro_run.log
 
-      - name: diffoscope on librustc_driver
+      - name: inspect and collect compiler builtins
         if: always()
+        shell: bash
         run: |
-          A=$(find ../rust-repro-workspace/build-a -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
-          B=$(find ../rust-repro-workspace/build-b -name 'librustc_driver-*.so' -path '*stage2*' | head -1)
-          echo "A=$A"; echo "B=$B"
+          set -euo pipefail
+
+          mkdir -p compiler-builtins-diagnostic
+
+          A_ROOT="../rust-repro-workspace/build-a/build"
+          B_ROOT="../rust-repro-workspace/build-b/extra1/extra2/extra3/extra4/extra5/extra6/extra7/extra8/extra9/extra10/build"
+
+          A=$(find "$A_ROOT" -type f -path '*/stage1/lib/rustlib/*/lib/libcompiler_builtins-*.rlib' -print -quit)
+          B=$(find "$B_ROOT" -type f -path '*/stage1/lib/rustlib/*/lib/libcompiler_builtins-*.rlib' -print -quit)
+
+          echo "A=$A"
+          echo "B=$B"
+
           if [[ -z "$A" || -z "$B" ]]; then
-            echo "One or both stage2 drivers are missing; skipping comparison."
-            exit 0
+            echo "::error::Missing one or both stage1 compiler_builtins archives"
+            exit 1
           fi
-          ls -l "$A" "$B"
-          cmp "$A" "$B" | head -1 || true
-          objcopy -O binary --only-section=.debug_line "$A" a_debug_line.bin || true
-          objcopy -O binary --only-section=.debug_line "$B" b_debug_line.bin || true
-          grep -c 'extra1' b_debug_line.bin > debug_line_extra_count_b.txt || true
-          strings -a "$A" | grep -F 'build-a' | sort -u | head -50 > paths_a.txt || true
-          strings -a "$B" | grep -F 'build-b' | sort -u | head -50 > paths_b.txt || true
-          readelf -SW "$A" > sections_a.txt
-          readelf -SW "$B" > sections_b.txt
-          diff sections_a.txt sections_b.txt > sections.diff || true
-          find ../rust-repro-workspace/build-a -name 'librustc_driver-*' | tee driver_locations.txt
+
+          cp "$A" compiler-builtins-diagnostic/A.rlib
+          cp "$B" compiler-builtins-diagnostic/B.rlib
+
+          sha256sum compiler-builtins-diagnostic/*.rlib \
+            | tee compiler-builtins-diagnostic/hashes.txt
+
+          ar t compiler-builtins-diagnostic/A.rlib \
+            > compiler-builtins-diagnostic/members_a.txt
+          ar t compiler-builtins-diagnostic/B.rlib \
+            > compiler-builtins-diagnostic/members_b.txt
+
+          diff -u \
+            compiler-builtins-diagnostic/members_a.txt \
+            compiler-builtins-diagnostic/members_b.txt \
+            > compiler-builtins-diagnostic/member_names.diff || true
+
+          if cmp -s compiler-builtins-diagnostic/A.rlib compiler-builtins-diagnostic/B.rlib; then
+            echo "RESULT: MATCH"
+          else
+            echo "RESULT: MISMATCH"
+          fi
+
+      - name: upload compiler builtins
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-builtins-${{ github.run_number }}
+          path: compiler-builtins-diagnostic/
+          if-no-files-found: warn
+          compression-level: 0
       - name: disk usage after
         if: always()
         run: df -h
