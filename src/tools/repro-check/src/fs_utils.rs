@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ignore::{Walk, WalkBuilder};
 use log::{info, warn};
 
 // Sets up two build envs by copying source (if not skipped), cleaning first if asked.
@@ -33,32 +32,11 @@ pub fn prepare_workspace(
     }
 
     if !skip_copy {
-        info!("Copying sources to A: {:?}", env_a);
-        copy_source_tree(src_root, &env_a)?;
+        info!("Cloning sources to A: {:?}", env_a);
+        clone_source_tree(src_root, &env_a)?;
 
-        info!("Copying sources to B: {:?}", env_b);
-        copy_source_tree(src_root, &env_b)?;
-
-        // Both copied roots need the same Git history for CI-LLVM.
-        // A .git pointer avoids duplicating the repository's object database.
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(src_root)
-            .args(["rev-parse", "--absolute-git-dir"])
-            .output()
-            .context("Failed to locate source Git metadata")?;
-
-        anyhow::ensure!(
-            output.status.success(),
-            "Git metadata lookup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let git_dir = String::from_utf8(output.stdout)?;
-        let git_link = format!("gitdir: {}\n", git_dir.trim());
-
-        fs::write(env_a.join(".git"), &git_link)?;
-        fs::write(env_b.join(".git"), &git_link)?;
+        info!("Cloning sources to B: {:?}", env_b);
+        clone_source_tree(src_root, &env_b)?;
     }
 
     Ok((env_a, env_b))
@@ -72,47 +50,85 @@ pub fn clean_workspace(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-// Copies the source tree, respecting .gitignore and skipping build/.git.
-// Uses ignore crate for git-like filtering.
-fn copy_source_tree(src: &Path, dest: &Path) -> Result<()> {
-    let walker: Walk = WalkBuilder::new(src)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(true)
-        .require_git(false)
-        .build();
+// Creates an independent checkout with its own Git index and worktree.
+// The main repository shares Git objects with the source for CI efficiency.
+// Submodules are initialized independently.
+fn clone_source_tree(src: &Path, dest: &Path) -> Result<()> {
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .context("Failed to resolve source HEAD")?;
 
-    for entry_res in walker {
-        let entry = entry_res?;
-        let from_path = entry.path();
+    anyhow::ensure!(
+        head.status.success(),
+        "Failed to resolve source HEAD: {}",
+        String::from_utf8_lossy(&head.stderr)
+    );
 
-        if from_path == src {
-            continue;
-        }
+    let commit = String::from_utf8(head.stdout)?;
+    let commit = commit.trim();
 
-        if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
-            continue;
-        }
+    let status = std::process::Command::new("git")
+        .args(["clone", "--shared", "--no-checkout", "--"])
+        .arg(src)
+        .arg(dest)
+        .status()
+        .context("Failed to clone source repository")?;
 
-        let rel_path = from_path.strip_prefix(src).context("Bad strip prefix")?;
+    anyhow::ensure!(status.success(), "Git clone failed for {}", dest.display());
 
-        if rel_path.starts_with(".git") || rel_path.starts_with("build") {
-            continue;
-        }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dest)
+        .args(["checkout", "--detach", commit])
+        .status()
+        .context("Failed to check out source revision")?;
 
-        let to_path = dest.join(rel_path);
+    anyhow::ensure!(status.success(), "Checkout failed for {}", dest.display());
 
-        if let Some(ft) = entry.file_type() {
-            if ft.is_dir() {
-                fs::create_dir_all(&to_path)?;
-            } else if ft.is_file() {
-                if let Some(parent) = to_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(from_path, &to_path).context(format!("Copy failed: {:?}", from_path))?;
-            }
-        }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dest)
+        .args(["submodule", "update", "--init", "--recursive", "--jobs", "4"])
+        .status()
+        .context("Failed to initialize submodules")?;
+
+    anyhow::ensure!(
+        status.success(),
+        "Submodule initialization failed for {}",
+        dest.display()
+    );
+
+    // Verify that Git operates on the new checkout, not the source.
+    for relative in [".", "src/llvm-project"] {
+        let path = dest.join(relative);
+        let expected = fs::canonicalize(&path)
+            .with_context(|| format!("Missing checkout directory: {}", path.display()))?;
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .context("Failed to verify checkout worktree")?;
+
+        anyhow::ensure!(
+            output.status.success(),
+            "Invalid Git checkout at {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let actual = fs::canonicalize(String::from_utf8(output.stdout)?.trim())?;
+
+        anyhow::ensure!(
+            actual == expected,
+            "Wrong Git worktree: expected {}, got {}",
+            expected.display(),
+            actual.display()
+        );
     }
 
     Ok(())
