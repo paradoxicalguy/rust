@@ -9,7 +9,6 @@ clap = { version = "4.5", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["clock"] }
 env_logger = "0.11"
 hex = "0.4"
-ignore = "0.4"
 log = "0.4"
 num_cpus = "1.16"
 rayon = "1.10"

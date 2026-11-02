@@ -1028,7 +1028,6 @@ dependencies = [
  "env_logger",
  "gimli",
  "hex",
- "ignore",
  "log",
  "num_cpus",
  "object",
