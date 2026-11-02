@@ -38,6 +38,27 @@ pub fn prepare_workspace(
 
         info!("Copying sources to B: {:?}", env_b);
         copy_source_tree(src_root, &env_b)?;
+
+        // Both copied roots need the same Git history for CI-LLVM.
+        // A .git pointer avoids duplicating the repository's object database.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(src_root)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .context("Failed to locate source Git metadata")?;
+
+        anyhow::ensure!(
+            output.status.success(),
+            "Git metadata lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let git_dir = String::from_utf8(output.stdout)?;
+        let git_link = format!("gitdir: {}\n", git_dir.trim());
+
+        fs::write(env_a.join(".git"), &git_link)?;
+        fs::write(env_b.join(".git"), &git_link)?;
     }
 
     Ok((env_a, env_b))
