@@ -24,7 +24,7 @@ fn predefine_mono_items<'tcx>(
         for &(mono_item, data) in mono_items {
             match mono_item {
                 MonoItem::Fn(instance) => {
-                    let name = tcx.symbol_name(instance).name;
+                    let name = crate::abi::function_symbol_name(tcx, instance);
                     let _inst_guard = crate::PrintOnPanic(|| format!("{:?} {}", instance, name));
                     let sig =
                         get_function_sig(tcx, module.target_config().default_call_conv, instance);
@@ -43,7 +43,7 @@ fn predefine_mono_items<'tcx>(
                         // file, so they can be declared on the fly.
                         continue;
                     }
-                    module.declare_function(name, linkage, &sig).unwrap();
+                    module.declare_function(&name, linkage, &sig).unwrap();
                 }
                 MonoItem::Static(_) | MonoItem::GlobalAsm(_) => {}
             }

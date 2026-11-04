@@ -1,13 +1,15 @@
 #![allow(non_camel_case_types)]
 
+use rustc_abi::{CanonAbi, X86Call};
 use rustc_attr_ir::PeImportNameType;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_crate_store::{DllCallingConvention, DllImport, DllImportSymbolType};
 use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{self, Instance, ScalarInt, TyCtxt};
+use rustc_middle::ty::{self, Instance, ScalarInt, Ty, TyCtxt};
 use rustc_span::{Span, bug, span_bug};
-use rustc_target::spec::{CfgAbi, Env, Os, Target};
+use rustc_target::spec::{Arch, CfgAbi, Env, Os, Target};
+use rustc_target::callconv::ArgAbi;
 
 use crate::traits::*;
 
@@ -172,6 +174,47 @@ pub fn asm_const_ptr_clean<'tcx>(tcx: TyCtxt<'tcx>, scalar: Scalar) -> Scalar {
 
 pub fn is_using_dlltool(target: &Target) -> bool {
     target.os == Os::Windows && target.env == Env::Gnu && target.cfg_abi == CfgAbi::Unspecified
+}
+
+/// Computes the total argument size used for Windows calling-convention
+/// symbol decoration. Each argument is rounded up to the pointer width.
+pub fn windows_abi_arg_bytes<'tcx>(
+    args: &[ArgAbi<'tcx, Ty<'tcx>>],
+    target: &Target,
+) -> u64 {
+    let pointer_bytes = target.pointer_width as u64 / 8;
+
+    args.iter()
+        .map(|arg| arg.layout.size.bytes().next_multiple_of(pointer_bytes))
+        .sum()
+}
+
+/// Computes the decorated symbol name for Windows calling conventions that
+/// encode the argument byte count in the symbol.
+pub fn windows_calling_convention_name<'tcx>(
+    name: &str,
+    target: &Target,
+    conv: CanonAbi,
+    args: &[ArgAbi<'tcx, Ty<'tcx>>],
+) -> Option<String> {
+    if !target.is_like_windows {
+        return None;
+    }
+
+    if name.starts_with('\x01') || name.starts_with('?') {
+        return None;
+    }
+
+    let (prefix, suffix) = match (&target.arch, conv) {
+        (Arch::X86, CanonAbi::X86(X86Call::Fastcall)) => ("@", "@"),
+        (Arch::X86, CanonAbi::X86(X86Call::Stdcall)) => ("_", "@"),
+        (Arch::X86, CanonAbi::X86(X86Call::Vectorcall))
+        | (Arch::X86_64, CanonAbi::X86(X86Call::Vectorcall)) => ("", "@@"),
+        _ => return None,
+    };
+
+    let args_in_bytes = windows_abi_arg_bytes(args, target);
+    Some(format!("{prefix}{name}{suffix}{args_in_bytes}"))
 }
 
 pub fn i686_decorated_name(

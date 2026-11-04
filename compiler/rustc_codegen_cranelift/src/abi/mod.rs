@@ -85,6 +85,30 @@ pub(crate) fn conv_to_call_conv(
     }
 }
 
+pub(crate) fn function_symbol_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    inst: Instance<'tcx>,
+) -> String {
+    let name = tcx.symbol_name(inst).name;
+    let fn_abi =
+        FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty());
+
+    if let Some(name) = name.strip_prefix('\x01') {
+        return name.to_string();
+    }
+
+    if name.starts_with('?') {
+        return name.to_string();
+    }
+
+    rustc_codegen_ssa::common::windows_calling_convention_name(
+        name,
+        &tcx.sess.target,
+        fn_abi.conv,
+        &fn_abi.args,
+    )
+    .unwrap_or_else(|| name.to_string())
+}
 pub(crate) fn get_function_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     default_call_conv: CallConv,
@@ -123,9 +147,9 @@ pub(crate) fn import_function<'tcx>(
     module: &mut dyn Module,
     inst: Instance<'tcx>,
 ) -> FuncId {
-    let name = tcx.symbol_name(inst).name;
+    let name = function_symbol_name(tcx, inst);
     let sig = get_function_sig(tcx, module.target_config().default_call_conv, inst);
-    declare_import_function(tcx, module, name, &sig)
+    declare_import_function(tcx, module, &name, &sig)
 }
 
 impl<'tcx> FunctionCx<'_, '_, 'tcx> {

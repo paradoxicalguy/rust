@@ -129,7 +129,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
 
                         let mut symbol = match fx.tcx.global_alloc(alloc_id) {
                             GlobalAlloc::Function { instance, .. } => {
-                                fx.tcx.symbol_name(instance).name.to_owned()
+                                crate::abi::function_symbol_name(fx.tcx, instance)
                             }
                             GlobalAlloc::Static(def_id) => {
                                 fx.tcx.symbol_name(Instance::mono(fx.tcx, def_id)).name.to_owned()
@@ -180,7 +180,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                         args.no_bound_vars().unwrap(),
                     )
                     .unwrap();
-                    let symbol = fx.tcx.symbol_name(instance);
+                    let symbol = crate::abi::function_symbol_name(fx.tcx, instance);
 
                     if FullyMonomorphizedLayoutCx(fx.tcx)
                         .fn_abi_of_instance(instance, ty::List::empty())
@@ -188,7 +188,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                         == CanonAbi::Custom
                     {
                         // We can't create a wrapper for custom ABI functions.
-                        CInlineAsmOperand::Symbol { symbol: symbol.name.to_owned() }
+                        CInlineAsmOperand::Symbol { symbol: symbol.clone() }
                     } else {
                         // Pass a wrapper rather than the function itself as the function itself may not
                         // be exported from the main codegen unit and may thus be unreachable from the
@@ -202,7 +202,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                         fx.inline_asm_index += 1;
                         let sig =
                             get_function_sig(fx.tcx, fx.target_config.default_call_conv, instance);
-                        create_wrapper_function(fx.module, sig, &wrapper_name, symbol.name);
+                        create_wrapper_function(fx.module, sig, &wrapper_name, &symbol);
 
                         CInlineAsmOperand::Symbol { symbol: wrapper_name }
                     }

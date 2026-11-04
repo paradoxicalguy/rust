@@ -43,7 +43,7 @@ pub(crate) fn codegen_fn<'tcx>(
 ) -> CodegenedFunction {
     debug_assert!(!instance.args.has_infer());
 
-    let symbol_name = tcx.symbol_name(instance).name.to_string();
+    let symbol_name = crate::abi::function_symbol_name(tcx, instance);
     let _timer = tcx.prof.generic_activity_with_arg("codegen fn", &*symbol_name);
 
     let mir = tcx.instance_mir(instance.def);
