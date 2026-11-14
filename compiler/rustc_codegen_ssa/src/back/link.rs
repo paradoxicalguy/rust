@@ -1225,6 +1225,59 @@ fn report_linker_output(
     }
 }
 
+// Both linker inputs have stable names, protected by the same per-output lock.
+// The lockfile must not be removed: another invocation could otherwise lock a
+// different inode while an earlier invocation still holds the original lock.
+struct StableLinkObjects {
+    metadata_path: PathBuf,
+    symbols_path: PathBuf,
+    _lock: Option<fs::File>,
+    keep: bool,
+    metadata_created: std::cell::Cell<bool>,
+    symbols_created: std::cell::Cell<bool>,
+}
+
+impl Drop for StableLinkObjects {
+    fn drop(&mut self) {
+        if !self.keep {
+            if self.metadata_created.get() {
+                let _ = fs::remove_file(&self.metadata_path);
+            }
+            if self.symbols_created.get() {
+                let _ = fs::remove_file(&self.symbols_path);
+            }
+        }
+    }
+}
+
+// Create a linker input under the per-output lock. A previous invocation may
+// have crashed, leaving a stale object. Never follow a pre-existing symlink.
+fn write_stable_link_object(
+    sess: &Session,
+    path: &Path,
+    data: &[u8],
+    created: &std::cell::Cell<bool>,
+) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => sess
+            .dcx()
+            .fatal(format!("failed to remove stale linker object {}: {e}", path.display())),
+    }
+
+    let mut file =
+        fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap_or_else(|e| {
+            sess.dcx().fatal(format!("failed to create linker object {}: {e}", path.display()))
+        });
+
+    // Cleanup must also cover a partially written object.
+    created.set(true);
+    file.write_all(data).unwrap_or_else(|e| {
+        sess.dcx().fatal(format!("failed to write linker object {}: {e}", path.display()))
+    });
+}
+
 /// Create a dynamic library or executable.
 ///
 /// This will invoke the system linker/cc to create the resulting file. This links to all upstream
@@ -1254,6 +1307,56 @@ fn link_natively(
         should_archive.then(|| tmpdir.join(out_filename.file_name().unwrap()).with_extension("so"));
     let temp_filename = archive_member.as_deref().unwrap_or(out_filename);
 
+    // Lock both stable linker inputs together, from object creation until
+    // the linker and any post-link processing have finished.
+    let stable_path = |suffix: &str| {
+        let mut name = out_filename.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+
+    // Keep linker input paths deterministic so they do not introduce
+    // nondeterminism into linker maps.
+    let metadata_path = stable_path(".rustc-rmeta.o");
+    let symbols_path = stable_path(".rustc-symbols.o");
+
+    let needs_metadata = matches!(crate_type, CrateType::Dylib | CrateType::ProcMacro);
+    let needs_symbols = !crate_info.linked_symbols[&crate_type].is_empty()
+        || (sess.target.is_like_msvc
+            && !crate_info.exported_symbols[&crate_type].is_empty()
+            && (crate_type != CrateType::Executable
+                || sess.opts.unstable_opts.export_executable_symbols));
+
+    let lock = if needs_metadata || needs_symbols {
+        // Keep the lockfile across invocations. Removing it could allow
+        // different processes to lock different inodes for the same path.
+        let lock_path = stable_path(".rustc-link.lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .unwrap_or_else(|e| {
+                sess.dcx().fatal(format!("failed to open {}: {e}", lock_path.display()))
+            });
+        lock.lock().unwrap_or_else(|e| {
+            sess.dcx().fatal(format!("failed to lock {}: {e}", lock_path.display()))
+        });
+
+        Some(lock)
+    } else {
+        None
+    };
+
+    let stable_objects = StableLinkObjects {
+        metadata_path,
+        symbols_path,
+        _lock: lock,
+        keep: sess.opts.cg.save_temps,
+        metadata_created: std::cell::Cell::new(false),
+        symbols_created: std::cell::Cell::new(false),
+    };
+
     let (mut cmd, jobserver_tokens) = linker_with_args(
         &linker_path,
         flavor,
@@ -1262,6 +1365,7 @@ fn link_natively(
         rmeta_link_cache,
         crate_type,
         tmpdir,
+        &stable_objects,
         temp_filename,
         compiled_modules,
         crate_info,
@@ -2537,7 +2641,8 @@ fn add_post_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor
 fn add_linked_symbol_object(
     cmd: &mut dyn Linker,
     sess: &Session,
-    tmpdir: &Path,
+    stable_symbols_path: &Path,
+    symbols_created: &std::cell::Cell<bool>,
     crate_type: CrateType,
     linked_symbols: &[(String, SymbolExportKind)],
     exported_symbols: &[SymbolExport],
@@ -2672,12 +2777,9 @@ fn add_linked_symbol_object(
         file.append_section_data(section, drectve.as_bytes(), 1);
     }
 
-    let path = tmpdir.join("symbols.o");
-    let result = std::fs::write(&path, file.write().unwrap());
-    if let Err(error) = result {
-        sess.dcx().emit_fatal(diagnostics::FailedToWrite { path, error });
-    }
-    cmd.add_object(&path);
+    let data = file.write().unwrap();
+    write_stable_link_object(sess, stable_symbols_path, &data, symbols_created);
+    cmd.add_object(stable_symbols_path);
 }
 
 /// Add object files containing code from the current crate.
@@ -2717,7 +2819,8 @@ fn add_local_crate_metadata_objects(
     sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     crate_type: CrateType,
-    tmpdir: &Path,
+    stable_metadata_path: &Path,
+    metadata_created: &std::cell::Cell<bool>,
     crate_info: &CrateInfo,
     metadata: &EncodedMetadata,
 ) {
@@ -2730,9 +2833,8 @@ fn add_local_crate_metadata_objects(
             &metadata,
             &crate_info.metadata_symbol,
         );
-        let obj = emit_wrapper_file(sess, &data, tmpdir, "rmeta.o");
-
-        cmd.add_object(&obj);
+        write_stable_link_object(sess, stable_metadata_path, &data, metadata_created);
+        cmd.add_object(stable_metadata_path);
     }
 }
 
@@ -2915,6 +3017,7 @@ fn linker_with_args(
     rmeta_link_cache: &mut RmetaLinkCache,
     crate_type: CrateType,
     tmpdir: &Path,
+    stable_objects: &StableLinkObjects,
     out_filename: &Path,
     compiled_modules: &CompiledModules,
     crate_info: &CrateInfo,
@@ -2975,7 +3078,8 @@ fn linker_with_args(
     add_linked_symbol_object(
         cmd,
         sess,
-        tmpdir,
+        &stable_objects.symbols_path,
+        &stable_objects.symbols_created,
         crate_type,
         &crate_info.linked_symbols[&crate_type],
         &export_symbols,
@@ -3017,7 +3121,8 @@ fn linker_with_args(
         sess,
         archive_builder_builder,
         crate_type,
-        tmpdir,
+        &stable_objects.metadata_path,
+        &stable_objects.metadata_created,
         crate_info,
         metadata,
     );
