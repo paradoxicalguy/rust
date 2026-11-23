@@ -1366,6 +1366,7 @@ pub enum DesugaringKind {
     PatTyRange,
     /// A format literal.
     FormatLiteral {
+        // Source availability affects diagnostics, not expansion identity.
         /// Was this format literal written in the source?
         /// - `format!("boo")` => Yes,
         /// - `format!(concat!("b", "o", "o"))` => No,
@@ -1373,6 +1374,7 @@ pub enum DesugaringKind {
         ///
         /// If it wasn't written in the source then we have to be careful with suggestions about
         /// rewriting it.
+        #[stable_hash(ignore)]
         source: bool,
     },
     RangeExpr,
