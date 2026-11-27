@@ -1765,12 +1765,6 @@ impl CrateMetadata {
                 // Some tests need the translation to be always skipped.
                 && tcx.sess.opts.unstable_opts.translate_remapped_path_to_local_path
             })
-            .filter(|virtual_dir| {
-                // Don't translate away `/rustc/$hash` if we're still remapping to it,
-                // since that means we're still building `std`/`rustc` that need it,
-                // and we don't want the real path to leak into codegen/debuginfo.
-                !tcx.sess.opts.remap_path_prefix.iter().any(|(_from, to)| to == virtual_dir)
-            })
         }
 
         let try_to_translate_virtual_to_real =
