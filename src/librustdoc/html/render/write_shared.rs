@@ -616,7 +616,10 @@ impl SourcesPart {
         cx.shared
             .local_sources
             .iter()
-            .filter_map(|p| p.0.strip_prefix(&cx.shared.src_root).ok())
+            .filter_map(|(local, href)| {
+                local.strip_prefix(&cx.shared.src_root).ok()?;
+                href.strip_suffix(".html").map(Path::new)
+            })
             .for_each(|source| hierarchy.add_path(source));
         let path = suffix_path("src-files.js", &cx.shared.resource_suffix);
         let hierarchy = hierarchy.to_json_string();

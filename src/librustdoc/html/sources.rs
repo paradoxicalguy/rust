@@ -65,11 +65,14 @@ impl LocalSourcesCollector<'_, '_> {
         let span = item.span(self.tcx);
         let Some(span) = span else { return };
         // skip all synthetic "files"
-        let Some(p) = filename_real_and_local(span, sess).and_then(|file| file.into_local_path())
-        else {
+        let Some(file) = filename_real_and_local(span, sess) else {
             return;
         };
-        if self.local_sources.contains_key(&*p) {
+        let Some(p) = file.local_path() else {
+            return;
+        };
+        let doc_path = file.path(RemapPathScopeComponents::DOCUMENTATION);
+        if self.local_sources.contains_key(p) {
             // We've already emitted this source
             return;
         }
@@ -77,7 +80,7 @@ impl LocalSourcesCollector<'_, '_> {
         let components = RefCell::new(Vec::new());
         clean_path(
             self.src_root,
-            &p,
+            doc_path,
             |component| {
                 components.borrow_mut().push(component.to_string_lossy().into_owned());
             },
@@ -87,10 +90,10 @@ impl LocalSourcesCollector<'_, '_> {
         );
 
         let mut href: String = components.into_inner().iter().map(|c| format!("{c}/")).collect();
-        let mut src_fname = p.file_name().expect("source has no filename").to_os_string();
+        let mut src_fname = doc_path.file_name().expect("source has no filename").to_os_string();
         src_fname.push(".html");
         href.push_str(&src_fname.to_string_lossy());
-        self.local_sources.insert(p, href);
+        self.local_sources.insert(p.to_path_buf(), href);
     }
 }
 
@@ -185,6 +188,7 @@ impl SourceCollector<'_, '_> {
         // Remove the utf-8 BOM if any
         let contents = contents.trim_prefix('\u{feff}');
 
+        let doc_path = file.path(RemapPathScopeComponents::DOCUMENTATION);
         let shared = &self.cx.shared;
         // Create the intermediate directories
         let cur = RefCell::new(PathBuf::new());
@@ -194,8 +198,8 @@ impl SourceCollector<'_, '_> {
         let extra_depth = Cell::new(0usize);
 
         clean_path(
-            &shared.src_root,
-            &p,
+            &shared.doc_src_root,
+            doc_path,
             |component| {
                 cur.borrow_mut().push(component);
                 extra_depth.set(extra_depth.get() + 1);
@@ -208,7 +212,7 @@ impl SourceCollector<'_, '_> {
 
         let jump_to_def_path_depth = 2 + extra_depth.get();
 
-        let src_fname = p.file_name().expect("source has no filename").to_os_string();
+        let src_fname = doc_path.file_name().expect("source has no filename").to_os_string();
         let mut fname = src_fname.clone();
         let mut file_path = Path::new(&self.crate_name).join(&*cur.borrow());
         file_path.push(&fname);
@@ -219,7 +223,7 @@ impl SourceCollector<'_, '_> {
         cur.push(&fname);
 
         let title = format!("{} - source", src_fname.to_string_lossy());
-        let desc = format!("Source of the Rust file `{}`.", p.to_string_lossy());
+        let desc = format!("Source of the Rust file `{}`.", doc_path.to_string_lossy());
         let root_path = "../".repeat(jump_to_def_path_depth);
         let page = layout::Page {
             title: &title,

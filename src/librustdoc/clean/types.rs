@@ -175,12 +175,7 @@ impl ExternalCrate {
     pub(crate) fn src_root(&self, tcx: TyCtxt<'_>) -> PathBuf {
         match self.src(tcx) {
             FileName::Real(ref p) => {
-                match p
-                    .local_path()
-                    .or(Some(p.path(RemapPathScopeComponents::DOCUMENTATION)))
-                    .unwrap()
-                    .parent()
-                {
+                match p.path(RemapPathScopeComponents::DOCUMENTATION).parent() {
                     Some(p) => p.to_path_buf(),
                     None => PathBuf::new(),
                 }

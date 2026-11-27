@@ -103,6 +103,8 @@ pub(crate) struct SharedContext<'tcx> {
     /// The path to the crate root source minus the file name.
     /// Used for simplifying paths to the highlighted source code files.
     pub(crate) src_root: PathBuf,
+    /// The crate's source root after documentation-scoped remapping.
+    pub(crate) doc_src_root: PathBuf,
     /// This describes the layout of each page, and is not modified after
     /// creation of the context (contains info like the favicon and added html).
     pub(crate) layout: layout::Layout,
@@ -388,10 +390,12 @@ impl<'tcx> Context<'tcx> {
 
         // We can safely ignore synthetic `SourceFile`s.
         let file = match span.filename(self.sess()) {
-            FileName::Real(ref path) => path
-                .local_path()
-                .unwrap_or(path.path(RemapPathScopeComponents::DOCUMENTATION))
-                .to_path_buf(),
+            FileName::Real(ref path) => if cnum == LOCAL_CRATE {
+                path.local_path().unwrap_or(path.path(RemapPathScopeComponents::DOCUMENTATION))
+            } else {
+                path.path(RemapPathScopeComponents::DOCUMENTATION)
+            }
+            .to_path_buf(),
             _ => return None,
         };
         let file = &file;
@@ -536,6 +540,14 @@ impl<'tcx> Context<'tcx> {
             }
             _ => PathBuf::new(),
         };
+        let doc_src_root = match krate.src(tcx) {
+            FileName::Real(ref p) => p
+                .path(RemapPathScopeComponents::DOCUMENTATION)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_path_buf(),
+            _ => PathBuf::new(),
+        };
         // If user passed in `--playground-url` arg, we fill in crate name here
         let mut playground = None;
         if let Some(url) = playground_url {
@@ -582,7 +594,7 @@ impl<'tcx> Context<'tcx> {
         let (local_sources, matches) = collect_spans_and_sources(
             tcx,
             &krate,
-            &src_root,
+            &doc_src_root,
             include_sources,
             generate_link_to_definition,
         );
@@ -591,6 +603,7 @@ impl<'tcx> Context<'tcx> {
         let scx = SharedContext {
             tcx,
             src_root,
+            doc_src_root,
             local_sources,
             issue_tracker_base_url,
             layout,
