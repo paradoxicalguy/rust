@@ -22,4 +22,29 @@ fn main() {
         .input("foo.o")
         .run()
         .assert_stdout_contains(".stack_sizes");
+
+    // Changing the flag must invalidate cached codegen artifacts.
+    for initial in ["no", "yes"] {
+        let cache = format!("incremental-{initial}");
+        let other = if initial == "yes" { "no" } else { "yes" };
+
+        for state in [initial, other, initial] {
+            rustc()
+                .input("foo.rs")
+                .crate_type("rlib")
+                .codegen_units(1)
+                .arg(format!("-Cincremental={cache}"))
+                .arg(format!("-Zemit-stack-sizes={state}"))
+                .output("libfoo.rlib")
+                .run();
+
+            let result = llvm_readobj().arg("--section-headers").input("libfoo.rlib").run();
+
+            if state == "yes" {
+                result.assert_stdout_contains(".stack_sizes");
+            } else {
+                result.assert_stdout_not_contains(".stack_sizes");
+            }
+        }
+    }
 }
