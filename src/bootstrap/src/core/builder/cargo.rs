@@ -1473,6 +1473,12 @@ impl Builder<'_> {
         }
 
         if matches!(mode, Mode::Std) {
+            // Preserve remapped sysroot paths when compiling std and its dependencies.
+            // Otherwise, imported spans can reintroduce checkout paths into debuginfo.
+            if self.config.rust_remap_debuginfo {
+                rustflags.arg("-Ztranslate-remapped-path-to-local-path=no");
+            }
+
             if let Some(mir_opt_level) = self.config.rust_validate_mir_opts {
                 rustflags.arg("-Zvalidate-mir");
                 rustflags.arg(&format!("-Zmir-opt-level={mir_opt_level}"));
