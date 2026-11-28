@@ -770,7 +770,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(trim_diagnostic_paths, false);
     untracked!(ui_testing, true);
     untracked!(unpretty, Some("expanded".to_string()));
-    untracked!(unstable_options, true);
     untracked!(validate_mir, true);
     untracked!(write_long_types_to_disk, false);
     // tidy-alphabetical-end
@@ -935,6 +934,7 @@ fn test_unstable_options_tracking_hash() {
         };
     }
     tracked_no_crate_hash!(no_codegen, true);
+    tracked_no_crate_hash!(unstable_options, true);
     tracked_no_crate_hash!(verbose_internals, true);
 }
 

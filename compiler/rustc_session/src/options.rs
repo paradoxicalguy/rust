@@ -3091,7 +3091,7 @@ written to standard error output)"),
     /// stable options. That separate check doesn't handle boolean values, so
     /// to avoid an inconsistent state we also forbid them here.
     #[rustc_lint_opt_deny_field_access("use `Session::unstable_options` instead of this field")]
-    unstable_options: bool = (false, parse_no_value, [UNTRACKED],
+    unstable_options: bool = (false, parse_no_value, [TRACKED_NO_CRATE_HASH],
         "adds unstable command line options to rustc interface (default: no)"),
     use_ctors_section: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "use legacy .ctors section for initializers rather than .init_array"),

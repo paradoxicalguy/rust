@@ -9,7 +9,7 @@
 #![rustc_partition_codegened(module="commandline_args", cfg="rpass2")]
 #![rustc_partition_reused(module="commandline_args", cfg="rpass3")]
 #![rustc_partition_codegened(module="commandline_args", cfg="rpass4")]
-#![rustc_partition_reused(module="commandline_args", cfg="rpass5")]
+#![rustc_partition_codegened(module="commandline_args", cfg="rpass5")]
 
 // Between revisions 1 and 2, we are changing the debuginfo-level, which should
 // invalidate the cache. Between revisions 2 and 3, we are adding `--diagnostic-width`
@@ -20,8 +20,8 @@
 //@[rpass3] compile-flags: -C debuginfo=2 --diagnostic-width=80
 //@[rpass4] compile-flags: -C debuginfo=2 --diagnostic-width=80 --remap-path-prefix=/home/bors/r=src
 // Regression test for https://github.com/rust-lang/rust/issues/156182.
-// `-Zunstable-options` enables internal lints, so the lint store changes without
-// changing the incremental command-line hash.
+// `-Zunstable-options` enables internal lints, so changing it must
+// invalidate the incremental cache (see #166701).
 //@[rpass5] compile-flags: -C debuginfo=2 --diagnostic-width=80 --remap-path-prefix=/home/bors/r=src -Zunstable-options
 //@ ignore-backends: gcc
 
